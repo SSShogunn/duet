@@ -14,6 +14,12 @@ Pair two Bluetooth speakers, a speaker and your headphones, or any mix of output
 
 **[Download Duet for Windows](https://github.com/SSShogunn/duet/releases/latest)**
 
+<br />
+
+<a href="docs/duet-demo.mp4"><img src="docs/duet-demo.gif" width="880" alt="Duet demo: two speakers 122 ms apart get synced with a sound you can't hear" /></a>
+
+<sub>Click the preview to watch the full video with sound.</sub>
+
 </div>
 
 ---
