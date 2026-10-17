@@ -12,9 +12,9 @@
   "app": {
     "windows": [
       {
-        "title": "audio-spil",
-        "width": 800,
-        "height": 600
+        "title": "Audio Split",
+        "width": 480,
+        "height": 680
       }
     ],
     "security": {
