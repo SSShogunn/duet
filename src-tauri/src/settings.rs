@@ -13,6 +13,8 @@ pub struct Settings {
     pub swap: bool,
     pub auto_sync: bool,
     pub initialized: bool,
+    pub debug_logging: bool,
+    pub theme: String,
 }
 
 impl Default for Settings {
@@ -24,6 +26,8 @@ impl Default for Settings {
             swap: false,
             auto_sync: true,
             initialized: false,
+            debug_logging: false,
+            theme: "system".into(),
         }
     }
 }

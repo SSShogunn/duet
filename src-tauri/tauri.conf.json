@@ -1,6 +1,6 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "audio-spil",
+  "productName": "Audio Split",
   "version": "0.1.0",
   "identifier": "com.sshogunn.audio-spil",
   "build": {
@@ -14,7 +14,12 @@
       {
         "title": "Audio Split",
         "width": 480,
-        "height": 680
+        "height": 720,
+        "visible": false,
+        "resizable": false,
+        "maximizable": false,
+        "fullscreen": false,
+        "center": true
       }
     ],
     "security": {

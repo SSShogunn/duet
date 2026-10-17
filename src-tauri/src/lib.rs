@@ -11,10 +11,14 @@ use controller::{Controller, Shared, StateView};
 use settings::SettingsStore;
 use tauri::menu::{Menu, MenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
-use tauri::{AppHandle, Manager, State, WindowEvent};
+use tauri::{AppHandle, LogicalSize, Manager, State, Theme, WebviewWindow, WindowEvent};
 use tauri_plugin_autostart::{MacosLauncher, ManagerExt};
+use tauri_plugin_log::{RotationStrategy, Target, TargetKind, TimezoneStrategy};
+use tauri_plugin_opener::OpenerExt;
 
 const HIDDEN_ARG: &str = "--minimized";
+
+struct StartHidden(bool);
 
 fn update<F: FnOnce(&mut Controller)>(app: &AppHandle, state: &State<Shared>, change: F) -> StateView {
     let view = {
@@ -90,6 +94,110 @@ fn set_autostart(app: AppHandle, enabled: bool) -> Result<bool, String> {
     Ok(launcher.is_enabled().unwrap_or(false))
 }
 
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AppInfo {
+    version: String,
+    debug_logging: bool,
+    log_dir: String,
+    theme: String,
+}
+
+fn log_level(debug: bool) -> log::LevelFilter {
+    if debug { log::LevelFilter::Debug } else { log::LevelFilter::Info }
+}
+
+#[tauri::command]
+fn get_app_info(app: AppHandle, state: State<Shared>) -> AppInfo {
+    let settings = state.lock().unwrap().settings.data.clone();
+    AppInfo {
+        version: app.package_info().version.to_string(),
+        debug_logging: settings.debug_logging,
+        log_dir: app.path().app_log_dir().map(|p| p.display().to_string()).unwrap_or_default(),
+        theme: settings.theme,
+    }
+}
+
+fn apply_theme(app: &AppHandle, theme: &str) {
+    if let Some(window) = app.get_webview_window("main") {
+        let _ = window.set_theme(match theme {
+            "light" => Some(Theme::Light),
+            "dark" => Some(Theme::Dark),
+            _ => None,
+        });
+    }
+}
+
+#[tauri::command]
+fn set_theme(app: AppHandle, state: State<Shared>, theme: String) -> String {
+    let theme = match theme.as_str() {
+        "light" | "dark" => theme,
+        _ => "system".to_string(),
+    };
+    let mut c = state.lock().unwrap();
+    c.settings.data.theme = theme.clone();
+    c.settings.save();
+    apply_theme(&app, &theme);
+    theme
+}
+
+#[tauri::command]
+fn set_debug_logging(state: State<Shared>, enabled: bool) -> bool {
+    let mut c = state.lock().unwrap();
+    c.settings.data.debug_logging = enabled;
+    c.settings.save();
+    log::set_max_level(log_level(enabled));
+    log::info!("debug logging {}", if enabled { "on" } else { "off" });
+    enabled
+}
+
+#[tauri::command]
+fn open_log_folder(app: AppHandle) -> Result<(), String> {
+    let dir = app.path().app_log_dir().map_err(|e| e.to_string())?;
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    app.opener().open_path(dir.display().to_string(), None::<&str>).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn open_sound_settings(app: AppHandle) -> Result<(), String> {
+    app.opener().open_url("ms-settings:sound", None::<&str>).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn reset_offsets(app: AppHandle, state: State<Shared>) -> StateView {
+    log::info!("speaker delays reset");
+    update(&app, &state, |c| c.reset_offsets())
+}
+
+#[tauri::command]
+fn quit_app(app: AppHandle) {
+    log::info!("quit from menu");
+    app.exit(0);
+}
+
+#[tauri::command]
+fn fit_window(window: WebviewWindow, start_hidden: State<StartHidden>, height: f64, first: bool) -> Result<(), String> {
+    let scale = window.scale_factor().map_err(|e| e.to_string())?;
+    let width = window.inner_size().map_err(|e| e.to_string())?.to_logical::<f64>(scale).width;
+    let limit = window
+        .current_monitor()
+        .ok()
+        .flatten()
+        .map(|m| m.work_area().size.to_logical::<f64>(m.scale_factor()).height - 60.0)
+        .unwrap_or(900.0);
+    window
+        .set_size(LogicalSize::new(width, height.min(limit).max(300.0)))
+        .map_err(|e| e.to_string())?;
+    if first {
+        let _ = window.center();
+        if !start_hidden.0 {
+            let _ = window.show();
+            let _ = window.set_focus();
+        }
+    }
+    Ok(())
+}
+
 fn show_window(app: &AppHandle) {
     if let Some(window) = app.get_webview_window("main") {
         let _ = window.unminimize();
@@ -133,17 +241,31 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_autostart::init(MacosLauncher::LaunchAgent, Some(vec![HIDDEN_ARG])))
+        .plugin(
+            tauri_plugin_log::Builder::new()
+                .clear_targets()
+                .target(Target::new(TargetKind::LogDir { file_name: Some("audio-split".into()) }))
+                .target(Target::new(TargetKind::Stdout))
+                .level(log::LevelFilter::Debug)
+                .level_for("wasapi", log::LevelFilter::Warn)
+                .level_for("tao", log::LevelFilter::Warn)
+                .level_for("wry", log::LevelFilter::Warn)
+                .max_file_size(2_000_000)
+                .rotation_strategy(RotationStrategy::KeepOne)
+                .timezone_strategy(TimezoneStrategy::UseLocal)
+                .build(),
+        )
         .setup(|app| {
             let dir = app.path().app_config_dir()?;
-            let shared: Shared = Arc::new(Mutex::new(Controller::new(SettingsStore::load(&dir))));
+            let settings = SettingsStore::load(&dir);
+            log::set_max_level(log_level(settings.data.debug_logging));
+            log::info!("Audio Split {} started", app.package_info().version);
+            apply_theme(app.handle(), &settings.data.theme);
+            let shared: Shared = Arc::new(Mutex::new(Controller::new(settings)));
             app.manage(shared.clone());
             build_tray(app.handle())?;
             controller::run_supervisor(app.handle().clone(), shared);
-            if std::env::args().any(|a| a == HIDDEN_ARG) {
-                if let Some(window) = app.get_webview_window("main") {
-                    let _ = window.hide();
-                }
-            }
+            app.manage(StartHidden(std::env::args().any(|a| a == HIDDEN_ARG)));
             Ok(())
         })
         .on_window_event(|window, event| {
@@ -161,7 +283,15 @@ pub fn run() {
             set_offset,
             sync_now,
             get_autostart,
-            set_autostart
+            set_autostart,
+            get_app_info,
+            set_debug_logging,
+            set_theme,
+            open_log_folder,
+            open_sound_settings,
+            reset_offsets,
+            quit_app,
+            fit_window
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

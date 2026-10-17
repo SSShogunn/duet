@@ -41,7 +41,6 @@ pub struct StateView {
     pub swap: bool,
     pub auto_sync: bool,
     pub last_sync: Option<String>,
-    pub glitches: u64,
 }
 
 pub struct Controller {
@@ -216,7 +215,23 @@ impl Controller {
             swap: self.settings.data.swap,
             auto_sync: self.settings.data.auto_sync,
             last_sync: self.last_sync.clone(),
-            glitches: handle.map(|h| h.glitches()).unwrap_or(0),
+        }
+    }
+
+    fn glitches(&self) -> u64 {
+        self.engine.as_ref().map(|e| e.handle().glitches()).unwrap_or(0)
+    }
+
+    fn device_names(&self) -> Vec<String> {
+        self.devices.iter().map(|d| d.name.clone()).collect()
+    }
+
+    pub fn reset_offsets(&mut self) {
+        self.settings.data.offsets.clear();
+        if let Some(engine) = &self.engine {
+            for id in engine.handle().target_ids() {
+                engine.handle().set_extra(&id, 0.0);
+            }
         }
     }
 }
@@ -269,6 +284,10 @@ pub fn start_sync(app: AppHandle, controller: Shared) -> Result<(), String> {
                 Err(e) => e.clone(),
             }
         };
+        match &result {
+            Ok(r) => log::info!("sync ok: gap {:.1} ms, offsets {:?}", r.gap_ms, r.offsets.iter().map(|(_, ms)| *ms).collect::<Vec<_>>()),
+            Err(e) => log::warn!("sync failed: {e}"),
+        }
         controller.lock().unwrap().last_sync = Some(message.clone());
         let title = if result.is_ok() { "Speakers synced" } else { "Sync failed" };
         let _ = app.notification().builder().title(title).body(&message).show();
@@ -286,17 +305,33 @@ pub fn run_supervisor(app: AppHandle, controller: Shared) {
     thread::spawn(move || {
         let _ = wasapi::initialize_mta();
         let mut last: Option<StateView> = None;
+        let mut last_status = String::new();
+        let mut last_glitches = 0u64;
+        let mut last_devices: Vec<String> = Vec::new();
         loop {
-            let (view, sync_due) = {
+            let (view, sync_due, glitches, names) = {
                 let mut c = controller.lock().unwrap();
                 c.tick();
                 let due = c.auto_sync_at.is_some_and(|at| Instant::now() >= at) && !c.syncing;
                 if due {
                     c.auto_sync_at = None;
                 }
-                (c.view(), due)
+                (c.view(), due, c.glitches(), c.device_names())
             };
+            if view.status != last_status {
+                log::info!("status: {}", view.status);
+                last_status = view.status.clone();
+            }
+            if names != last_devices {
+                log::debug!("output devices: {}", names.join(" | "));
+                last_devices = names;
+            }
+            if glitches > last_glitches {
+                log::warn!("audio glitch: {} new (total {glitches} this session)", glitches - last_glitches);
+            }
+            last_glitches = glitches;
             if sync_due {
+                log::info!("auto-sync starting");
                 let _ = start_sync(app.clone(), controller.clone());
             }
             if last.as_ref() != Some(&view) {

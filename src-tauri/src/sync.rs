@@ -94,7 +94,9 @@ pub fn laptop_sync(handle: &EngineHandle) -> Result<SyncResult, String> {
         return Err("Speakers changed during the sync. Try again.".into());
     }
 
+    log::debug!("sync recording: {} samples", recording.len());
     let lateness = dsp::measure(&recording, SOURCE_RATE, &pattern)?;
+    log::debug!("sync lateness per speaker (ms): {lateness:?}");
     let latest = lateness.iter().fold(f32::MIN, |m, v| m.max(*v));
     let earliest = lateness.iter().fold(f32::MAX, |m, v| m.min(*v));
     let wanted: Vec<f32> = ids

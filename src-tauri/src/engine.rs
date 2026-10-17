@@ -78,6 +78,7 @@ impl Shared {
     }
 
     fn fail(&self, message: String) {
+        log::error!("audio engine stopped: {message}");
         if let Ok(mut error) = self.error.lock() {
             error.get_or_insert(message);
         }
@@ -355,6 +356,7 @@ fn render(shared: &Shared, target: &Target, frames: usize, state: &mut PlayState
         if fade_in || avail_ms > latency + SKIP_MARGIN_MS {
             if !fade_in {
                 target.glitches.fetch_add(1, Ordering::Relaxed);
+                log::debug!("speaker {} skipped {:.0} ms to catch up", target.id, avail_ms - latency);
             }
             let skip = (((avail_ms - latency) * rate / 1000.0) as usize).min(queue.len());
             queue.drain(..skip);
@@ -370,6 +372,7 @@ fn render(shared: &Shared, target: &Target, frames: usize, state: &mut PlayState
                 target.glitches.fetch_add(1, Ordering::Relaxed);
                 let bumped = (load_f32(&shared.latency_ms) + LATENCY_STEP_MS).min(MAX_LATENCY_MS);
                 store_f32(&shared.latency_ms, bumped);
+                log::debug!("speaker {} ran out of audio; buffer raised to {bumped} ms", target.id);
             }
             state.priming = true;
             return out;
