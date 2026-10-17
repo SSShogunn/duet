@@ -8,6 +8,10 @@ export function shortName(name: string) {
   return name.replace(/^Speakers \(/, "").replace(/\)$/, "");
 }
 
+export function virtualLabel(name: string) {
+  return name.replace(/ \(VB-Audio Virtual Cable\)$/, "");
+}
+
 export const toneClass: Record<Tone, string> = {
   ok: "bg-ok-soft text-ok",
   busy: "bg-busy-soft text-busy",

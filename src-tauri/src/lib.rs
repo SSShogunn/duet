@@ -2,6 +2,7 @@ mod controller;
 mod devices;
 mod dsp;
 mod engine;
+mod errors;
 mod settings;
 mod sync;
 
@@ -69,6 +70,11 @@ fn set_auto_sync(app: AppHandle, state: State<Shared>, enabled: bool) -> StateVi
 }
 
 #[tauri::command]
+fn set_sync_sound(app: AppHandle, state: State<Shared>, sound: String) -> StateView {
+    update(&app, &state, |c| c.settings.data.sync_sound = if sound == "chime" { sound } else { "silent".into() })
+}
+
+#[tauri::command]
 fn set_offset(app: AppHandle, state: State<Shared>, id: String, ms: f32) -> StateView {
     update(&app, &state, |c| {
         let ms = ms.clamp(0.0, 500.0);
@@ -90,7 +96,8 @@ fn get_autostart(app: AppHandle) -> bool {
 #[tauri::command]
 fn set_autostart(app: AppHandle, enabled: bool) -> Result<bool, String> {
     let launcher = app.autolaunch();
-    if enabled { launcher.enable() } else { launcher.disable() }.map_err(|e| e.to_string())?;
+    if enabled { launcher.enable() } else { launcher.disable() }
+        .map_err(|e| errors::report("start with Windows", e, "Couldn't change the start-with-Windows setting."))?;
     Ok(launcher.is_enabled().unwrap_or(false))
 }
 
@@ -153,14 +160,24 @@ fn set_debug_logging(state: State<Shared>, enabled: bool) -> bool {
 
 #[tauri::command]
 fn open_log_folder(app: AppHandle) -> Result<(), String> {
-    let dir = app.path().app_log_dir().map_err(|e| e.to_string())?;
-    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-    app.opener().open_path(dir.display().to_string(), None::<&str>).map_err(|e| e.to_string())
+    let failed = |e: String| errors::report("open log folder", e, "Couldn't open the log folder.");
+    let dir = app.path().app_log_dir().map_err(|e| failed(e.to_string()))?;
+    std::fs::create_dir_all(&dir).map_err(|e| failed(e.to_string()))?;
+    app.opener().open_path(dir.display().to_string(), None::<&str>).map_err(|e| failed(e.to_string()))
 }
 
 #[tauri::command]
 fn open_sound_settings(app: AppHandle) -> Result<(), String> {
-    app.opener().open_url("ms-settings:sound", None::<&str>).map_err(|e| e.to_string())
+    app.opener()
+        .open_url("ms-settings:sound", None::<&str>)
+        .map_err(|e| errors::report("open sound settings", e, "Couldn't open Windows sound settings."))
+}
+
+#[tauri::command]
+fn open_vb_cable_page(app: AppHandle) -> Result<(), String> {
+    app.opener()
+        .open_url("https://vb-audio.com/Cable/", None::<&str>)
+        .map_err(|e| errors::report("open VB-Cable page", e, "Couldn't open the browser. Go to vb-audio.com/Cable to download it."))
 }
 
 #[tauri::command]
@@ -213,7 +230,7 @@ fn build_tray(app: &AppHandle) -> tauri::Result<()> {
     let menu = Menu::with_items(app, &[&open, &sync, &quit])?;
     TrayIconBuilder::with_id("main")
         .icon(app.default_window_icon().cloned().expect("app icon"))
-        .tooltip("Audio Split")
+        .tooltip("Duet")
         .menu(&menu)
         .show_menu_on_left_click(false)
         .on_menu_event(|app, event| match event.id.as_ref() {
@@ -244,7 +261,7 @@ pub fn run() {
         .plugin(
             tauri_plugin_log::Builder::new()
                 .clear_targets()
-                .target(Target::new(TargetKind::LogDir { file_name: Some("audio-split".into()) }))
+                .target(Target::new(TargetKind::LogDir { file_name: Some("duet".into()) }))
                 .target(Target::new(TargetKind::Stdout))
                 .level(log::LevelFilter::Debug)
                 .level_for("wasapi", log::LevelFilter::Warn)
@@ -259,7 +276,7 @@ pub fn run() {
             let dir = app.path().app_config_dir()?;
             let settings = SettingsStore::load(&dir);
             log::set_max_level(log_level(settings.data.debug_logging));
-            log::info!("Audio Split {} started", app.package_info().version);
+            log::info!("Duet {} started", app.package_info().version);
             apply_theme(app.handle(), &settings.data.theme);
             let shared: Shared = Arc::new(Mutex::new(Controller::new(settings)));
             app.manage(shared.clone());
@@ -280,6 +297,7 @@ pub fn run() {
             set_stereo,
             swap_sides,
             set_auto_sync,
+            set_sync_sound,
             set_offset,
             sync_now,
             get_autostart,
@@ -289,6 +307,7 @@ pub fn run() {
             set_theme,
             open_log_folder,
             open_sound_settings,
+            open_vb_cable_page,
             reset_offsets,
             quit_app,
             fit_window

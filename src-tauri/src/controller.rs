@@ -14,7 +14,6 @@ use crate::sync;
 const POLL: Duration = Duration::from_millis(500);
 const RETRY_DELAY: Duration = Duration::from_secs(3);
 const AUTO_SYNC_DELAY: Duration = Duration::from_secs(8);
-const FIRST_RUN_MATCH: &str = "Echo Dot";
 
 #[derive(Serialize, Clone, PartialEq)]
 #[serde(rename_all = "camelCase")]
@@ -40,6 +39,7 @@ pub struct StateView {
     pub stereo: bool,
     pub swap: bool,
     pub auto_sync: bool,
+    pub sync_sound: String,
     pub last_sync: Option<String>,
 }
 
@@ -117,21 +117,14 @@ impl Controller {
         match devices::list_outputs() {
             Ok(list) => self.devices = list,
             Err(e) => {
-                self.status = format!("Couldn't read audio devices ({e})");
+                let message = "Couldn't read your audio devices. Retrying...".to_string();
+                if self.status != message {
+                    log::error!("listing audio devices failed: {e}");
+                }
+                self.status = message;
                 return;
             }
         }
-        if !self.settings.data.initialized {
-            self.settings.data.targets = self
-                .devices
-                .iter()
-                .filter(|d| !d.is_virtual && d.name.contains(FIRST_RUN_MATCH))
-                .map(|d| d.id.clone())
-                .collect();
-            self.settings.data.initialized = true;
-            self.settings.save();
-        }
-
         let source = self.devices.iter().find(|d| d.is_default && d.is_virtual).cloned();
         let wanted = self.wanted_targets();
         let wanted_ids: Vec<String> = wanted.iter().map(|d| d.id.clone()).collect();
@@ -153,7 +146,7 @@ impl Controller {
             let name = self.devices.iter().find(|d| d.is_virtual).map(|d| d.name.clone());
             self.status = match name {
                 Some(name) => format!("Idle. Select \"{name}\" as your Windows sound output to start."),
-                None => "VB-Audio Virtual Cable isn't installed.".into(),
+                None => "Duet needs the free VB-Audio Virtual Cable driver. Install it, then restart your PC.".into(),
             };
             return;
         };
@@ -168,6 +161,7 @@ impl Controller {
                 .zip(self.sides(&wanted))
                 .map(|(d, side)| TargetSpec {
                     id: d.id.clone(),
+                    name: d.name.clone(),
                     extra_ms: self.settings.data.offsets.get(&d.id).copied().unwrap_or(0.0),
                     channel: side,
                 })
@@ -214,6 +208,7 @@ impl Controller {
             stereo: self.settings.data.stereo,
             swap: self.settings.data.swap,
             auto_sync: self.settings.data.auto_sync,
+            sync_sound: self.settings.data.sync_sound.clone(),
             last_sync: self.last_sync.clone(),
         }
     }
@@ -241,7 +236,7 @@ pub fn short(name: &str) -> String {
 }
 
 pub fn start_sync(app: AppHandle, controller: Shared) -> Result<(), String> {
-    let handle = {
+    let (handle, silent) = {
         let mut c = controller.lock().unwrap();
         if c.syncing {
             return Err("A sync is already running.".into());
@@ -255,12 +250,18 @@ pub fn start_sync(app: AppHandle, controller: Shared) -> Result<(), String> {
         }
         c.syncing = true;
         c.auto_sync_at = None;
-        handle
+        (handle, c.settings.data.sync_sound != "chime")
     };
     emit(&app, &controller);
     thread::spawn(move || {
         let _ = wasapi::initialize_mta();
-        let result = sync::laptop_sync(&handle);
+        let mut result = sync::laptop_sync(&handle, silent);
+        if silent && handle.is_running() {
+            if let Err(e) = &result {
+                log::info!("silent sync failed ({e}); trying the chime");
+                result = sync::laptop_sync(&handle, false);
+            }
+        }
         let message = {
             let mut c = controller.lock().unwrap();
             c.syncing = false;
@@ -327,7 +328,7 @@ pub fn run_supervisor(app: AppHandle, controller: Shared) {
                 last_devices = names;
             }
             if glitches > last_glitches {
-                log::warn!("audio glitch: {} new (total {glitches} this session)", glitches - last_glitches);
+                log::debug!("glitches: {} new (total {glitches} this session)", glitches - last_glitches);
             }
             last_glitches = glitches;
             if sync_due {

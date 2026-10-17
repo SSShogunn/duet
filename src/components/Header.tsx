@@ -9,7 +9,7 @@ export function Header(props: { onMenu: () => void }) {
         <AppLogo size={30} />
       </span>
       <div className="flex-1">
-        <h1 className="text-title font-semibold">Audio Split</h1>
+        <h1 className="text-title font-semibold">Duet</h1>
         <p className="text-caption text-muted">Play your PC audio on every speaker</p>
       </div>
       <IconButton label="Menu" onClick={props.onMenu}>

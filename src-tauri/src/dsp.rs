@@ -8,6 +8,8 @@ pub const SYNC_PERIOD_S: f32 = 0.6;
 pub const SYNC_LEVEL: f32 = 0.3;
 pub const SYNC_BANDS: [(f32, f32); 4] = [(800.0, 3200.0), (3200.0, 800.0), (1000.0, 4000.0), (4000.0, 1000.0)];
 const SYNC_BELLS: [f32; 4] = [1047.0, 784.0, 1319.0, 880.0];
+pub const SILENT_BANDS: [(f32, f32); 2] = [(19000.0, 20800.0), (20800.0, 19000.0)];
+const SILENT_LEVEL: f32 = 0.15;
 const SYNC_SEARCH_S: f32 = 0.2;
 const SYNC_MIN_GOOD: usize = 3;
 const SYNC_AGREE_MS: f32 = 15.0;
@@ -24,25 +26,38 @@ pub struct SyncPattern {
     pub offsets: Vec<Vec<f32>>,
     pub bands: Vec<(f32, f32)>,
     pub length_s: f32,
+    pub silent: bool,
 }
 
-pub fn chirp(rate: u32, band: (f32, f32)) -> Vec<f32> {
+pub fn chirp(rate: u32, band: (f32, f32), silent: bool) -> Vec<f32> {
     let (f0, f1) = band;
     let count = (rate as f32 * CHIRP_S) as usize;
     (0..count)
         .map(|i| {
             let t = i as f32 / rate as f32;
             let phase = 2.0 * PI * (f0 * t + (f1 - f0) * t * t / (2.0 * CHIRP_S));
-            let envelope = (t / CHIME_ATTACK_S).min(1.0) * (-t / CHIME_SWEEP_DECAY_S).exp();
+            let envelope = if silent {
+                0.5 - 0.5 * (2.0 * PI * t / CHIRP_S).cos()
+            } else {
+                (t / CHIME_ATTACK_S).min(1.0) * (-t / CHIME_SWEEP_DECAY_S).exp()
+            };
             phase.sin() * envelope
         })
         .collect()
 }
 
-pub fn chime(rate: u32, speaker: usize) -> Vec<f32> {
+fn normalize(signal: Vec<f32>, level: f32) -> Vec<f32> {
+    let peak = signal.iter().fold(0f32, |m, v| m.max(v.abs())).max(1e-9);
+    signal.iter().map(|v| v / peak * level).collect()
+}
+
+pub fn chime(rate: u32, speaker: usize, silent: bool) -> Vec<f32> {
+    if silent {
+        return normalize(chirp(rate, SILENT_BANDS[speaker % SILENT_BANDS.len()], true), SILENT_LEVEL);
+    }
     let band = SYNC_BANDS[speaker % SYNC_BANDS.len()];
     let bell_hz = SYNC_BELLS[speaker % SYNC_BELLS.len()];
-    let sweep = chirp(rate, band);
+    let sweep = chirp(rate, band, false);
     let count = (rate as f32 * CHIME_RING_S) as usize;
     let mut out: Vec<f32> = (0..count)
         .map(|i| {
@@ -55,32 +70,33 @@ pub fn chime(rate: u32, speaker: usize) -> Vec<f32> {
     for (o, s) in out.iter_mut().zip(sweep.iter()) {
         *o += s;
     }
-    let peak = out.iter().fold(0f32, |m, v| m.max(v.abs())).max(1e-9);
-    out.iter().map(|v| v / peak * SYNC_LEVEL).collect()
+    normalize(out, SYNC_LEVEL)
 }
 
-pub fn build_pattern(speakers: usize) -> SyncPattern {
-    let slots = speakers.div_ceil(SYNC_BANDS.len()).max(1);
+pub fn build_pattern(speakers: usize, silent: bool) -> SyncPattern {
+    let palette: &[(f32, f32)] = if silent { &SILENT_BANDS } else { &SYNC_BANDS };
+    let slots = speakers.div_ceil(palette.len()).max(1);
     let period = slots as f32 * SYNC_PERIOD_S;
     let offsets = (0..SYNC_ROUNDS)
         .map(|round| {
             (0..speakers)
-                .map(|k| round as f32 * period + (k / SYNC_BANDS.len()) as f32 * SYNC_PERIOD_S)
+                .map(|k| round as f32 * period + (k / palette.len()) as f32 * SYNC_PERIOD_S)
                 .collect()
         })
         .collect();
-    let bands = (0..speakers).map(|k| SYNC_BANDS[k % SYNC_BANDS.len()]).collect();
+    let bands = (0..speakers).map(|k| palette[k % palette.len()]).collect();
     SyncPattern {
         offsets,
         bands,
         length_s: SYNC_ROUNDS as f32 * period + 0.5,
+        silent,
     }
 }
 
 pub fn render_pattern(pattern: &SyncPattern, rate: u32, speaker: usize) -> Vec<f32> {
     let length = (pattern.length_s * rate as f32) as usize;
     let mut mono = vec![0f32; length];
-    let tone = chime(rate, speaker);
+    let tone = chime(rate, speaker, pattern.silent);
     for row in &pattern.offsets {
         let at = (row[speaker] * rate as f32) as usize;
         for (i, v) in tone.iter().enumerate() {
@@ -105,8 +121,8 @@ fn median(values: &[f32]) -> f32 {
     }
 }
 
-fn envelope(recording: &[f32], rate: u32, band: (f32, f32), planner: &mut FftPlanner<f32>) -> Vec<f32> {
-    let template = chirp(rate, band);
+fn envelope(recording: &[f32], rate: u32, band: (f32, f32), silent: bool, planner: &mut FftPlanner<f32>) -> Vec<f32> {
+    let template = chirp(rate, band, silent);
     let size = (recording.len() + template.len()).next_power_of_two();
     let fft = planner.plan_fft_forward(size);
     let ifft = planner.plan_fft_inverse(size);
@@ -153,7 +169,7 @@ pub fn measure(recording: &[f32], rate: u32, pattern: &SyncPattern) -> Result<Ve
         return Err("Your laptop's noise cancelling muted the chimes. Turn it off in your laptop's audio app (e.g. Lenovo Vantage > Microphone noise cancelling > Off) and try again.".into());
     }
     let mut planner = FftPlanner::new();
-    let envs: Vec<Vec<f32>> = pattern.bands.iter().map(|b| envelope(recording, rate, *b, &mut planner)).collect();
+    let envs: Vec<Vec<f32>> = pattern.bands.iter().map(|b| envelope(recording, rate, *b, pattern.silent, &mut planner)).collect();
     let combined: Vec<f32> = (0..recording.len())
         .map(|i| envs.iter().fold(0f32, |m, e| m.max(e[i])))
         .collect();
@@ -242,8 +258,8 @@ pub fn measure(recording: &[f32], rate: u32, pattern: &SyncPattern) -> Result<Ve
 mod tests {
     use super::*;
 
-    fn fake_recording(rate: u32, gap_ms: f32, noise: f32) -> (Vec<f32>, SyncPattern) {
-        let pattern = build_pattern(2);
+    fn fake_recording(rate: u32, gap_ms: f32, noise: f32, silent: bool) -> (Vec<f32>, SyncPattern) {
+        let pattern = build_pattern(2, silent);
         let total = ((pattern.length_s + 2.0) * rate as f32) as usize;
         let mut seed = 12345u32;
         let mut rec: Vec<f32> = (0..total)
@@ -253,7 +269,7 @@ mod tests {
             })
             .collect();
         for k in 0..2 {
-            let tone = chime(rate, k);
+            let tone = chime(rate, k, silent);
             for row in &pattern.offsets {
                 let delay = 0.7 + 0.3 + if k == 1 { gap_ms / 1000.0 } else { 0.0 };
                 let at = ((row[k] + delay) * rate as f32) as usize;
@@ -268,19 +284,21 @@ mod tests {
 
     #[test]
     fn measures_known_gaps() {
-        for (gap, noise, rate) in [(23.0, 0.01, 48000), (-40.0, 0.01, 48000), (0.0, 0.03, 44100), (120.0, 0.01, 48000), (35.0, 0.05, 48000)] {
-            let (rec, pattern) = fake_recording(rate, gap, noise);
-            let late = measure(&rec, rate, &pattern).expect("measure");
-            let measured = late[1] - late[0];
-            assert!((measured - gap).abs() < 1.0, "gap {gap}: measured {measured}");
+        for silent in [false, true] {
+            for (gap, noise, rate) in [(23.0, 0.01, 48000), (-40.0, 0.01, 48000), (0.0, 0.03, 48000), (120.0, 0.01, 48000), (35.0, 0.05, 48000)] {
+                let (rec, pattern) = fake_recording(rate, gap, noise, silent);
+                let late = measure(&rec, rate, &pattern).expect("measure");
+                let measured = late[1] - late[0];
+                assert!((measured - gap).abs() < 1.0, "silent {silent}, gap {gap}: measured {measured}");
+            }
         }
     }
 
     #[test]
     fn rejects_silence_and_gating() {
-        let pattern = build_pattern(2);
+        let pattern = build_pattern(2, false);
         assert!(measure(&vec![0.0; 48000 * 6], 48000, &pattern).is_err());
-        let quiet: Vec<f32> = (0..48000 * 6).map(|i| ((i * 7919) % 101) as f32 * 1e-5).collect();
+        let quiet: Vec<f32> = (0..48000u64 * 6).map(|i| ((i * 7919) % 101) as f32 * 1e-5).collect();
         assert!(measure(&quiet, 48000, &pattern).is_err());
     }
 }

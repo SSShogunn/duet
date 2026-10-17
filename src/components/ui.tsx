@@ -82,6 +82,32 @@ export function Section(props: { title: string; children: ReactNode }) {
   );
 }
 
+export function Segmented<T extends string>(props: {
+  value: T;
+  options: { value: T; label: string }[];
+  label: string;
+  onChange: (value: T) => void;
+}) {
+  return (
+    <div className="flex shrink-0 gap-1 rounded-md border border-line p-0.5" role="radiogroup" aria-label={props.label}>
+      {props.options.map((o) => (
+        <button
+          key={o.value}
+          role="radio"
+          aria-checked={props.value === o.value}
+          onClick={() => props.onChange(o.value)}
+          className={cx(
+            "h-7 rounded px-3 text-caption",
+            props.value === o.value ? "bg-accent font-semibold text-on-accent" : "text-muted hover:bg-soft",
+          )}
+        >
+          {o.label}
+        </button>
+      ))}
+    </div>
+  );
+}
+
 export function SideBadge(props: { side: "L" | "R" }) {
   return (
     <span

@@ -3,6 +3,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { Header } from "./components/Header";
 import { OptionsSection } from "./components/OptionsSection";
+import { SetupGuide } from "./components/SetupGuide";
 import { SettingsMenu } from "./components/SettingsMenu";
 import { SpeakersSection } from "./components/SpeakersSection";
 import { StatusCard } from "./components/StatusCard";
@@ -45,7 +46,8 @@ function App() {
       setError(null);
       return result;
     } catch (e) {
-      setError(String(e));
+      console.error(command, e);
+      setError(typeof e === "string" ? e : "Something went wrong. Details are in the log.");
       return null;
     }
   }
@@ -59,6 +61,12 @@ function App() {
     const result = await call<boolean>("set_autostart", { enabled });
     if (result !== null) setAutostartState(result);
   }
+
+  useEffect(() => {
+    if (!error) return;
+    const timer = setTimeout(() => setError(null), 8000);
+    return () => clearTimeout(timer);
+  }, [error]);
 
   useEffect(() => {
     call<StateView>("get_state").then((s) => s && setState(s));
@@ -84,10 +92,11 @@ function App() {
   return (
     <main ref={fitRef} className="flex flex-col gap-5 px-5 pt-4 pb-5">
       <Header onMenu={() => setMenuOpen(true)} />
+      <SetupGuide state={state} chosenCount={chosen.length} call={call} />
       <StatusCard state={state} tone={tone} canSync={canSync} error={error} call={call} />
       <SpeakersSection speakers={speakers} change={change} />
       <OptionsSection state={state} chosen={chosen} change={change} autostart={autostart} setAutostart={setAutostart} />
-      <p className="text-center text-caption text-muted">Closing the window keeps Audio Split running in the tray.</p>
+      <p className="text-center text-caption text-muted">Closing the window keeps Duet running in the tray.</p>
       {menuOpen && (
         <SettingsMenu info={info} setInfo={setInfo} call={call} change={change} onClose={() => setMenuOpen(false)} />
       )}

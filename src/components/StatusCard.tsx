@@ -1,5 +1,5 @@
 import { CircleCheck, CirclePause, RefreshCw, TriangleAlert } from "lucide-react";
-import { cx, shortName, toneClass } from "../lib";
+import { cx, toneClass } from "../lib";
 import type { Call, StateView, Tone } from "../types";
 import { Button } from "./ui";
 
@@ -22,11 +22,6 @@ export function StatusCard(props: { state: StateView; tone: Tone; canSync: boole
       <div className="min-w-0 flex-1">
         <div className="font-semibold">{headlines[tone]}</div>
         <div className="text-caption text-muted">{state.status}</div>
-        {!state.virtualSelected && state.virtualName && (
-          <div className="text-caption text-muted">
-            Set Windows output to <strong className="text-fg">{shortName(state.virtualName)}</strong>
-          </div>
-        )}
         {state.lastSync && !state.syncing && <div className="text-caption text-muted">{state.lastSync}</div>}
         {props.error && <div className="text-caption text-error">{props.error}</div>}
       </div>

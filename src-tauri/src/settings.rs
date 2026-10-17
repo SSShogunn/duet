@@ -12,9 +12,9 @@ pub struct Settings {
     pub stereo: bool,
     pub swap: bool,
     pub auto_sync: bool,
-    pub initialized: bool,
     pub debug_logging: bool,
     pub theme: String,
+    pub sync_sound: String,
 }
 
 impl Default for Settings {
@@ -25,9 +25,9 @@ impl Default for Settings {
             stereo: false,
             swap: false,
             auto_sync: true,
-            initialized: false,
             debug_logging: false,
             theme: "system".into(),
+            sync_sound: "silent".into(),
         }
     }
 }

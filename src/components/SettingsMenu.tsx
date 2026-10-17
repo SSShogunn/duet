@@ -58,7 +58,7 @@ export function SettingsMenu(props: {
         <div className="flex items-center justify-between">
           <div>
             <h2 className="text-title font-semibold">Settings</h2>
-            <p className="text-caption text-muted">Audio Split {info?.version ?? ""}</p>
+            <p className="text-caption text-muted">Duet {info?.version ?? ""}</p>
           </div>
           <IconButton label="Close" onClick={props.onClose}>
             <X size={20} />
@@ -110,7 +110,7 @@ export function SettingsMenu(props: {
         />
 
         <div className="mt-auto flex flex-col pt-4">
-          <MenuItem icon={<LogOut size={18} />} label="Quit Audio Split" danger onClick={() => call("quit_app")} />
+          <MenuItem icon={<LogOut size={18} />} label="Quit Duet" danger onClick={() => call("quit_app")} />
           {info?.logDir && <p className="mt-2 text-[12px] break-all text-muted">Logs: {info.logDir}</p>}
         </div>
       </aside>

@@ -1,7 +1,12 @@
-import { ArrowLeftRight, Power, Zap } from "lucide-react";
+import { ArrowLeftRight, AudioWaveform, Power, Zap } from "lucide-react";
 import { shortName } from "../lib";
-import type { Change, DeviceView, StateView } from "../types";
-import { IconButton, Section, SettingCard, SideBadge, Switch } from "./ui";
+import type { Change, DeviceView, StateView, SyncSound } from "../types";
+import { IconButton, Section, Segmented, SettingCard, SideBadge, Switch } from "./ui";
+
+const syncSounds: { value: SyncSound; label: string }[] = [
+  { value: "silent", label: "Silent" },
+  { value: "chime", label: "Chime" },
+];
 
 export function OptionsSection(props: {
   state: StateView;
@@ -45,6 +50,18 @@ export function OptionsSection(props: {
       )}
       <SettingCard icon={<Zap size={20} />} title="Auto-sync" detail="Sync a few seconds after speakers connect">
         <Switch checked={state.autoSync} label="Auto-sync" onChange={(v) => props.change("set_auto_sync", { enabled: v })} />
+      </SettingCard>
+      <SettingCard
+        icon={<AudioWaveform size={20} />}
+        title="Sync sound"
+        detail={state.syncSound === "silent" ? "A pitch too high for most people to hear" : "A short, audible chime"}
+      >
+        <Segmented
+          value={state.syncSound}
+          options={syncSounds}
+          label="Sync sound"
+          onChange={(sound) => props.change("set_sync_sound", { sound })}
+        />
       </SettingCard>
       <SettingCard icon={<Power size={20} />} title="Start with Windows" detail="Opens in the tray when you sign in">
         <Switch checked={props.autostart} label="Start with Windows" onChange={props.setAutostart} />

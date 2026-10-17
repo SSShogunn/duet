@@ -18,8 +18,11 @@ export type StateView = {
   stereo: boolean;
   swap: boolean;
   autoSync: boolean;
+  syncSound: SyncSound;
   lastSync: string | null;
 };
+
+export type SyncSound = "silent" | "chime";
 
 export type Theme = "system" | "light" | "dark";
 

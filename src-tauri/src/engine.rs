@@ -5,9 +5,12 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use wasapi::{DeviceEnumerator, Direction, SampleType, StreamMode, WaveFormat};
+use wasapi::{AudioClientProperties, DeviceEnumerator, Direction, SampleType, StreamMode, StreamOption, WaveFormat};
+use windows::core::w;
+use windows::Win32::System::Threading::AvSetMmThreadCharacteristicsW;
 
 use crate::devices::EndpointVolume;
+use crate::errors;
 
 pub const SOURCE_RATE: u32 = 48_000;
 const CHANNELS: usize = 2;
@@ -21,6 +24,8 @@ const FADE_FRAMES: usize = 240;
 const CAPTURE_RECENT_MS: u64 = 50;
 const PUMP_CHUNK_MS: u64 = 10;
 const VOLUME_POLL_MS: u64 = 50;
+const RENDER_BUFFER_HNS: i64 = 500_000;
+const CAPTURE_BUFFER_HNS: i64 = 2_000_000;
 
 type Res<T> = Result<T, Box<dyn Error>>;
 
@@ -38,12 +43,14 @@ fn store_f32(value: &AtomicU32, v: f32) {
 
 pub struct TargetSpec {
     pub id: String,
+    pub name: String,
     pub extra_ms: f32,
     pub channel: Option<usize>,
 }
 
 struct Target {
     id: String,
+    name: String,
     queue: Mutex<VecDeque<[f32; 2]>>,
     extra_ms: AtomicU32,
     channel: AtomicI32,
@@ -62,6 +69,7 @@ struct Shared {
     gain: AtomicU32,
     latency_ms: AtomicU32,
     last_capture_ms: AtomicU64,
+    capture_glitches: AtomicU64,
     started: Instant,
     targets: Vec<Arc<Target>>,
     injection: Mutex<Option<Injection>>,
@@ -80,7 +88,7 @@ impl Shared {
     fn fail(&self, message: String) {
         log::error!("audio engine stopped: {message}");
         if let Ok(mut error) = self.error.lock() {
-            error.get_or_insert(message);
+            error.get_or_insert(errors::friendly(&message));
         }
         self.running.store(false, Ordering::SeqCst);
     }
@@ -115,7 +123,8 @@ impl EngineHandle {
     }
 
     pub fn glitches(&self) -> u64 {
-        self.0.targets.iter().map(|t| t.glitches.load(Ordering::Relaxed)).sum()
+        let speakers: u64 = self.0.targets.iter().map(|t| t.glitches.load(Ordering::Relaxed)).sum();
+        speakers + self.0.capture_glitches.load(Ordering::Relaxed)
     }
 
     pub fn play_pattern(&self, signals: Vec<Vec<f32>>) {
@@ -149,6 +158,7 @@ impl Engine {
             .map(|spec| {
                 Arc::new(Target {
                     id: spec.id,
+                    name: spec.name,
                     queue: Mutex::new(VecDeque::new()),
                     extra_ms: AtomicU32::new(spec.extra_ms.max(0.0).to_bits()),
                     channel: AtomicI32::new(spec.channel.map(|c| c as i32).unwrap_or(-1)),
@@ -163,6 +173,7 @@ impl Engine {
             gain: AtomicU32::new(1f32.to_bits()),
             latency_ms: AtomicU32::new(START_LATENCY_MS.to_bits()),
             last_capture_ms: AtomicU64::new(0),
+            capture_glitches: AtomicU64::new(0),
             started: Instant::now(),
             targets,
             injection: Mutex::new(None),
@@ -202,6 +213,10 @@ where
 {
     thread::spawn(move || {
         let _ = wasapi::initialize_mta();
+        let mut task = 0u32;
+        if let Err(e) = unsafe { AvSetMmThreadCharacteristicsW(w!("Pro Audio"), &mut task) } {
+            log::warn!("couldn't raise audio thread priority: {e}");
+        }
         if let Err(error) = work(&shared) {
             shared.fail(error.to_string());
         }
@@ -219,14 +234,14 @@ fn push_all(shared: &Shared, frames: &[[f32; 2]]) {
 fn capture_loop(shared: &Shared, source_id: &str) -> Res<()> {
     let device = DeviceEnumerator::new()?.get_device(source_id)?;
     let mut client = device.get_iaudioclient()?;
-    let (_, min_period) = client.get_device_period()?;
     let mode = StreamMode::PollingShared {
         autoconvert: true,
-        buffer_duration_hns: min_period * 10,
+        buffer_duration_hns: CAPTURE_BUFFER_HNS,
     };
     client.initialize_client(&stream_format(), &Direction::Capture, &mode)?;
     let capture = client.get_audiocaptureclient()?;
     let mut bytes = VecDeque::new();
+    let mut first_packet = true;
     client.start_stream()?;
 
     while shared.running.load(Ordering::SeqCst) {
@@ -236,6 +251,11 @@ fn capture_loop(shared: &Shared, source_id: &str) -> Res<()> {
             if info.flags.silent {
                 bytes.range_mut(before..).for_each(|b| *b = 0);
             }
+            if info.flags.data_discontinuity && !first_packet {
+                shared.capture_glitches.fetch_add(1, Ordering::Relaxed);
+                log::warn!("glitch: audio capture fell behind and lost sound");
+            }
+            first_packet = false;
         }
         if !bytes.is_empty() {
             let usable = bytes.len() - bytes.len() % FRAME_BYTES;
@@ -330,6 +350,7 @@ fn render(shared: &Shared, target: &Target, frames: usize, state: &mut PlayState
     let extra_ms = load_f32(&target.extra_ms);
     let latency = load_f32(&shared.latency_ms) + extra_ms;
     let mut fade_in = false;
+    let mut tail: Vec<[f32; 2]> = Vec::new();
     {
         let mut queue = target.queue.lock().unwrap();
         let wanted_extra = (extra_ms * rate / 1000.0) as i64;
@@ -356,7 +377,8 @@ fn render(shared: &Shared, target: &Target, frames: usize, state: &mut PlayState
         if fade_in || avail_ms > latency + SKIP_MARGIN_MS {
             if !fade_in {
                 target.glitches.fetch_add(1, Ordering::Relaxed);
-                log::debug!("speaker {} skipped {:.0} ms to catch up", target.id, avail_ms - latency);
+                log::warn!("glitch: {} had {:.0} ms too much audio queued, skipped ahead", target.name, avail_ms - latency);
+                tail = queue.iter().skip(state.pos as usize).take(FADE_FRAMES).copied().collect();
             }
             let skip = (((avail_ms - latency) * rate / 1000.0) as usize).min(queue.len());
             queue.drain(..skip);
@@ -372,7 +394,7 @@ fn render(shared: &Shared, target: &Target, frames: usize, state: &mut PlayState
                 target.glitches.fetch_add(1, Ordering::Relaxed);
                 let bumped = (load_f32(&shared.latency_ms) + LATENCY_STEP_MS).min(MAX_LATENCY_MS);
                 store_f32(&shared.latency_ms, bumped);
-                log::debug!("speaker {} ran out of audio; buffer raised to {bumped} ms", target.id);
+                log::warn!("glitch: {} ran out of audio, buffer raised to {bumped} ms", target.name);
             }
             state.priming = true;
             return out;
@@ -390,6 +412,13 @@ fn render(shared: &Shared, target: &Target, frames: usize, state: &mut PlayState
         let drop = new_pos as usize;
         queue.drain(..drop);
         state.pos = new_pos - drop as f64;
+    }
+
+    let blend = frames.min(tail.len());
+    for i in 0..blend {
+        let g = i as f32 / blend as f32;
+        out[i * 2] = tail[i][0] * (1.0 - g) + out[i * 2] * g;
+        out[i * 2 + 1] = tail[i][1] * (1.0 - g) + out[i * 2 + 1] * g;
     }
 
     if fade_in {
@@ -423,10 +452,12 @@ fn render(shared: &Shared, target: &Target, frames: usize, state: &mut PlayState
 fn playback_loop(shared: &Shared, target: &Target) -> Res<()> {
     let device = DeviceEnumerator::new()?.get_device(&target.id)?;
     let mut client = device.get_iaudioclient()?;
-    let (default_period, _) = client.get_device_period()?;
+    if let Err(e) = client.set_properties(AudioClientProperties::new().set_option(StreamOption::Raw)) {
+        log::debug!("{}: raw mode unavailable ({e})", target.name);
+    }
     let mode = StreamMode::EventsShared {
         autoconvert: true,
-        buffer_duration_hns: default_period,
+        buffer_duration_hns: RENDER_BUFFER_HNS,
     };
     client.initialize_client(&stream_format(), &Direction::Render, &mode)?;
     let event = client.set_get_eventhandle()?;
