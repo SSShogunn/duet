@@ -11,6 +11,7 @@ use windows::Win32::System::Threading::AvSetMmThreadCharacteristicsW;
 
 use crate::devices::EndpointVolume;
 use crate::errors;
+use crate::visual::{Analyzer, BANDS};
 
 pub const SOURCE_RATE: u32 = 48_000;
 const CHANNELS: usize = 2;
@@ -21,13 +22,17 @@ const LATENCY_STEP_MS: f32 = 20.0;
 const MAX_SPEED_ADJUST: f64 = 0.005;
 const SKIP_MARGIN_MS: f32 = 60.0;
 const FADE_FRAMES: usize = 240;
+const SKIP_BLEND_FRAMES: usize = 960;
+const HISTORY_FRAMES: usize = 48_000;
 const CAPTURE_RECENT_MS: u64 = 50;
 const PUMP_CHUNK_MS: u64 = 10;
 const VOLUME_POLL_MS: u64 = 50;
 const RENDER_BUFFER_HNS: i64 = 500_000;
 const CAPTURE_BUFFER_HNS: i64 = 2_000_000;
+const LEVEL_DECAY: f32 = 0.9;
 
 type Res<T> = Result<T, Box<dyn Error>>;
+type Frame = [f32; 3];
 
 fn stream_format() -> WaveFormat {
     WaveFormat::new(32, 32, &SampleType::Float, SOURCE_RATE as usize, CHANNELS, None)
@@ -51,10 +56,11 @@ pub struct TargetSpec {
 struct Target {
     id: String,
     name: String,
-    queue: Mutex<VecDeque<[f32; 2]>>,
+    queue: Mutex<VecDeque<Frame>>,
     extra_ms: AtomicU32,
     channel: AtomicI32,
     glitches: AtomicU64,
+    level: AtomicU32,
 }
 
 struct Injection {
@@ -65,6 +71,7 @@ struct Injection {
 struct Shared {
     running: AtomicBool,
     calibrating: AtomicBool,
+    overlay: AtomicBool,
     pumping: AtomicBool,
     gain: AtomicU32,
     latency_ms: AtomicU32,
@@ -74,6 +81,7 @@ struct Shared {
     targets: Vec<Arc<Target>>,
     injection: Mutex<Option<Injection>>,
     error: Mutex<Option<String>>,
+    spectrum: Mutex<Vec<f32>>,
 }
 
 impl Shared {
@@ -122,18 +130,40 @@ impl EngineHandle {
         self.0.running.load(Ordering::SeqCst)
     }
 
+    pub fn speaker_glitches(&self) -> Vec<(String, u64)> {
+        self.0.targets.iter().map(|t| (t.name.clone(), t.glitches.load(Ordering::Relaxed))).collect()
+    }
+
+    pub fn meters(&self) -> (Vec<f32>, Vec<(String, f32)>) {
+        let live = self.0.capture_recent() && !self.0.calibrating.load(Ordering::SeqCst);
+        let spectrum = if live { self.0.spectrum.lock().unwrap().clone() } else { vec![0.0; BANDS] };
+        let levels = self
+            .0
+            .targets
+            .iter()
+            .map(|t| (t.id.clone(), if live { load_f32(&t.level).min(1.0) } else { 0.0 }))
+            .collect();
+        (spectrum, levels)
+    }
+
     pub fn glitches(&self) -> u64 {
         let speakers: u64 = self.0.targets.iter().map(|t| t.glitches.load(Ordering::Relaxed)).sum();
         speakers + self.0.capture_glitches.load(Ordering::Relaxed)
     }
 
-    pub fn play_pattern(&self, signals: Vec<Vec<f32>>) {
+    pub fn play_pattern(&self, signals: Vec<Vec<f32>>, keep_music: bool) -> bool {
+        let over_music = keep_music && self.0.capture_recent();
         *self.0.injection.lock().unwrap() = Some(Injection { signals, pos: 0 });
+        if over_music {
+            self.0.overlay.store(true, Ordering::SeqCst);
+            return true;
+        }
         self.0.calibrating.store(true, Ordering::SeqCst);
         if !self.0.pumping.swap(true, Ordering::SeqCst) {
             let shared = self.0.clone();
             thread::spawn(move || pump_loop(&shared));
         }
+        false
     }
 
     pub fn pattern_done(&self) -> bool {
@@ -142,6 +172,7 @@ impl EngineHandle {
 
     pub fn end_calibration(&self) {
         *self.0.injection.lock().unwrap() = None;
+        self.0.overlay.store(false, Ordering::SeqCst);
         self.0.calibrating.store(false, Ordering::SeqCst);
     }
 }
@@ -163,12 +194,14 @@ impl Engine {
                     extra_ms: AtomicU32::new(spec.extra_ms.max(0.0).to_bits()),
                     channel: AtomicI32::new(spec.channel.map(|c| c as i32).unwrap_or(-1)),
                     glitches: AtomicU64::new(0),
+                    level: AtomicU32::new(0),
                 })
             })
             .collect();
         let shared = Arc::new(Shared {
             running: AtomicBool::new(true),
             calibrating: AtomicBool::new(false),
+            overlay: AtomicBool::new(false),
             pumping: AtomicBool::new(false),
             gain: AtomicU32::new(1f32.to_bits()),
             latency_ms: AtomicU32::new(START_LATENCY_MS.to_bits()),
@@ -178,6 +211,7 @@ impl Engine {
             targets,
             injection: Mutex::new(None),
             error: Mutex::new(None),
+            spectrum: Mutex::new(vec![0.0; BANDS]),
         });
 
         let mut threads = Vec::new();
@@ -224,9 +258,29 @@ where
 }
 
 fn push_all(shared: &Shared, frames: &[[f32; 2]]) {
-    for target in &shared.targets {
+    let mut injection = shared.overlay.load(Ordering::SeqCst).then(|| shared.injection.lock().unwrap());
+    for (k, target) in shared.targets.iter().enumerate() {
+        let signal = injection
+            .as_ref()
+            .and_then(|guard| guard.as_ref())
+            .and_then(|inj| inj.signals.get(k).map(|s| (s, inj.pos)));
         if let Ok(mut queue) = target.queue.lock() {
-            queue.extend(frames.iter().copied());
+            queue.extend(frames.iter().enumerate().map(|(i, f)| {
+                let sync = signal.and_then(|(s, pos)| s.get(pos + i).copied()).unwrap_or(0.0);
+                [f[0], f[1], sync]
+            }));
+        }
+    }
+    if let Some(guard) = injection.as_mut() {
+        let done = match guard.as_mut() {
+            Some(inj) => {
+                inj.pos += frames.len();
+                inj.signals.iter().all(|s| inj.pos >= s.len())
+            }
+            None => false,
+        };
+        if done {
+            **guard = None;
         }
     }
 }
@@ -242,6 +296,7 @@ fn capture_loop(shared: &Shared, source_id: &str) -> Res<()> {
     let capture = client.get_audiocaptureclient()?;
     let mut bytes = VecDeque::new();
     let mut first_packet = true;
+    let mut analyzer = Analyzer::new(SOURCE_RATE);
     client.start_stream()?;
 
     while shared.running.load(Ordering::SeqCst) {
@@ -272,6 +327,9 @@ fn capture_loop(shared: &Shared, source_id: &str) -> Res<()> {
                     .collect();
                 shared.last_capture_ms.store(shared.now_ms(), Ordering::Relaxed);
                 push_all(shared, &frames);
+                if let Some(bands) = analyzer.push(&frames) {
+                    *shared.spectrum.lock().unwrap() = bands;
+                }
             }
         }
         thread::sleep(Duration::from_millis(3));
@@ -287,12 +345,12 @@ fn pump_loop(shared: &Shared) {
         {
             let mut injection = shared.injection.lock().unwrap();
             for (k, target) in shared.targets.iter().enumerate() {
-                let mut frames = vec![[0f32; 2]; chunk];
+                let mut frames: Vec<Frame> = vec![[0.0; 3]; chunk];
                 if let Some(inj) = injection.as_ref() {
                     if let Some(signal) = inj.signals.get(k) {
                         for (i, frame) in frames.iter_mut().enumerate() {
                             let v = signal.get(inj.pos + i).copied().unwrap_or(0.0);
-                            *frame = [v, v];
+                            *frame = [0.0, 0.0, v];
                         }
                     }
                 }
@@ -342,22 +400,38 @@ struct PlayState {
     fill_ms: f32,
     last_gain: f32,
     applied_extra_frames: i64,
+    history: VecDeque<Frame>,
+    tail: Vec<Frame>,
+    tail_pos: usize,
+    music_peak: f32,
+    empty_renders: u32,
+    reported_frames: usize,
 }
 
 fn render(shared: &Shared, target: &Target, frames: usize, state: &mut PlayState) -> Vec<f32> {
     let mut out = vec![0f32; frames * CHANNELS];
     let rate = SOURCE_RATE as f32;
     let extra_ms = load_f32(&target.extra_ms);
-    let latency = load_f32(&shared.latency_ms) + extra_ms;
     let mut fade_in = false;
-    let mut tail: Vec<[f32; 2]> = Vec::new();
+    let mut sync = vec![0f32; frames];
+    let queued_ms: f32;
+    let target_ms: f32;
     {
         let mut queue = target.queue.lock().unwrap();
         let wanted_extra = (extra_ms * rate / 1000.0) as i64;
         let shift = wanted_extra - state.applied_extra_frames;
+        if shift != 0 {
+            state.tail = queue.iter().skip(state.pos as usize).take(SKIP_BLEND_FRAMES).copied().collect();
+            state.tail_pos = 0;
+        }
         if shift > 0 {
-            for _ in 0..shift {
-                queue.push_front([0.0, 0.0]);
+            let replay = shift as usize;
+            let from_history = replay.min(state.history.len());
+            for frame in state.history.iter().rev().take(from_history) {
+                queue.push_front(*frame);
+            }
+            for _ in from_history..replay {
+                queue.push_front([0.0; 3]);
             }
         } else if shift < 0 {
             let drop = (-shift as usize).min(queue.len());
@@ -365,10 +439,14 @@ fn render(shared: &Shared, target: &Target, frames: usize, state: &mut PlayState
             state.pos = 0.0;
         }
         state.applied_extra_frames = wanted_extra;
+        let latency = load_f32(&shared.latency_ms) + extra_ms;
 
         let mut avail_ms = ((queue.len() as f64 - state.pos) * 1000.0 / rate as f64) as f32;
+        queued_ms = avail_ms;
+        target_ms = latency;
         if state.priming {
             if avail_ms < latency {
+                state.empty_renders += 1;
                 return out;
             }
             state.priming = false;
@@ -378,7 +456,8 @@ fn render(shared: &Shared, target: &Target, frames: usize, state: &mut PlayState
             if !fade_in {
                 target.glitches.fetch_add(1, Ordering::Relaxed);
                 log::warn!("glitch: {} had {:.0} ms too much audio queued, skipped ahead", target.name, avail_ms - latency);
-                tail = queue.iter().skip(state.pos as usize).take(FADE_FRAMES).copied().collect();
+                state.tail = queue.iter().skip(state.pos as usize).take(SKIP_BLEND_FRAMES).copied().collect();
+                state.tail_pos = 0;
             }
             let skip = (((avail_ms - latency) * rate / 1000.0) as usize).min(queue.len());
             queue.drain(..skip);
@@ -397,6 +476,7 @@ fn render(shared: &Shared, target: &Target, frames: usize, state: &mut PlayState
                 log::warn!("glitch: {} ran out of audio, buffer raised to {bumped} ms", target.name);
             }
             state.priming = true;
+            state.empty_renders += 1;
             return out;
         }
         for i in 0..frames {
@@ -407,18 +487,24 @@ fn render(shared: &Shared, target: &Target, frames: usize, state: &mut PlayState
             let b = queue[i0 + 1];
             out[i * 2] = a[0] + (b[0] - a[0]) * frac;
             out[i * 2 + 1] = a[1] + (b[1] - a[1]) * frac;
+            sync[i] = a[2] + (b[2] - a[2]) * frac;
         }
         let new_pos = state.pos + frames as f64 * ratio;
         let drop = new_pos as usize;
-        queue.drain(..drop);
+        state.history.extend(queue.drain(..drop));
+        let excess = state.history.len().saturating_sub(HISTORY_FRAMES);
+        state.history.drain(..excess);
         state.pos = new_pos - drop as f64;
     }
 
-    let blend = frames.min(tail.len());
-    for i in 0..blend {
-        let g = i as f32 / blend as f32;
-        out[i * 2] = tail[i][0] * (1.0 - g) + out[i * 2] * g;
-        out[i * 2 + 1] = tail[i][1] * (1.0 - g) + out[i * 2 + 1] * g;
+    let mut i = 0;
+    while i < frames && state.tail_pos < state.tail.len() {
+        let g = state.tail_pos as f32 / state.tail.len() as f32;
+        let t = state.tail[state.tail_pos];
+        out[i * 2] = t[0] * (1.0 - g) + out[i * 2] * g;
+        out[i * 2 + 1] = t[1] * (1.0 - g) + out[i * 2 + 1] * g;
+        i += 1;
+        state.tail_pos += 1;
     }
 
     if fade_in {
@@ -428,7 +514,7 @@ fn render(shared: &Shared, target: &Target, frames: usize, state: &mut PlayState
             out[i * 2 + 1] *= g;
         }
     }
-    let gain = if shared.calibrating.load(Ordering::SeqCst) { 1.0 } else { load_f32(&shared.gain) };
+    let gain = load_f32(&shared.gain);
     if gain != 1.0 || state.last_gain != 1.0 {
         for i in 0..frames {
             let g = state.last_gain + (gain - state.last_gain) * (i + 1) as f32 / frames as f32;
@@ -445,6 +531,29 @@ fn render(shared: &Shared, target: &Target, frames: usize, state: &mut PlayState
             out[i * 2] = v;
             out[i * 2 + 1] = v;
         }
+    }
+    let peak = out.iter().fold(0f32, |m, v| m.max(v.abs()));
+    store_f32(&target.level, peak.max(load_f32(&target.level) * LEVEL_DECAY));
+    state.music_peak = state.music_peak.max(peak);
+    state.reported_frames += frames;
+    if state.reported_frames >= SOURCE_RATE as usize * 5 {
+        log::debug!(
+            "{}: music peak {:.3}, gain {:.2}, channel {}, queued {:.0} ms of {:.0} ms target, empty renders {}",
+            target.name,
+            state.music_peak,
+            gain,
+            channel,
+            queued_ms,
+            target_ms,
+            state.empty_renders
+        );
+        state.music_peak = 0.0;
+        state.empty_renders = 0;
+        state.reported_frames = 0;
+    }
+    for (i, s) in sync.iter().enumerate() {
+        out[i * 2] += s;
+        out[i * 2 + 1] += s;
     }
     out
 }
@@ -468,6 +577,12 @@ fn playback_loop(shared: &Shared, target: &Target) -> Res<()> {
         fill_ms: 0.0,
         last_gain: load_f32(&shared.gain),
         applied_extra_frames: (load_f32(&target.extra_ms) * SOURCE_RATE as f32 / 1000.0) as i64,
+        history: VecDeque::with_capacity(HISTORY_FRAMES),
+        tail: Vec::new(),
+        tail_pos: 0,
+        music_peak: 0.0,
+        empty_renders: 0,
+        reported_frames: 0,
     };
     client.start_stream()?;
 

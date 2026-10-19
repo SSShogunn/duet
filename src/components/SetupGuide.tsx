@@ -2,7 +2,7 @@ import type { ReactNode } from "react";
 import { Check, Download, Settings } from "lucide-react";
 import { cx, virtualLabel } from "../lib";
 import type { Call, StateView } from "../types";
-import { Button } from "./ui";
+import { SmallButton } from "./ui";
 
 type Step = {
   title: ReactNode;
@@ -14,17 +14,17 @@ type Step = {
 function StepRow(props: { step: Step; number: number; current: boolean }) {
   const { step } = props;
   return (
-    <li className="flex items-start gap-3">
+    <li className="flex min-h-14 items-center gap-3 border-b border-rule py-2.5">
       <span
         className={cx(
-          "mt-0.5 grid size-6 shrink-0 place-items-center rounded-full text-caption font-semibold",
-          step.done ? "bg-ok-soft text-ok" : props.current ? "bg-accent text-on-accent" : "bg-soft text-muted",
+          "grid size-6 shrink-0 place-items-center rounded-full text-caption font-bold",
+          step.done ? "bg-ok text-bg" : props.current ? "bg-ink text-bg" : "border-[1.5px] border-muted text-muted",
         )}
       >
-        {step.done ? <Check size={14} /> : props.number}
+        {step.done ? <Check size={14} strokeWidth={3} /> : props.number}
       </span>
       <div className="min-w-0 flex-1">
-        <div className={cx(step.done ? "text-muted line-through" : !props.current && "text-muted")}>{step.title}</div>
+        <div className={cx(props.current ? "font-semibold" : "text-muted", step.done && "line-through")}>{step.title}</div>
         {props.current && <div className="text-caption text-muted">{step.detail}</div>}
       </div>
       {props.current && step.action}
@@ -41,45 +41,45 @@ export function SetupGuide(props: { state: StateView; chosenCount: number; call:
       detail: "A free driver Duet listens to. Install it, then restart your PC.",
       done: state.virtualName !== null,
       action: (
-        <Button primary onClick={() => props.call("open_vb_cable_page")}>
-          <Download size={16} />
+        <SmallButton onClick={() => props.call("open_vb_cable_page")}>
+          <Download size={14} />
           Get it
-        </Button>
+        </SmallButton>
       ),
     },
     {
       title: (
         <>
-          Set Windows sound output to <strong>{output}</strong>
+          Set Windows output to <strong>{output}</strong>
         </>
       ),
       detail: "Pick it under Output in Windows sound settings.",
       done: state.virtualSelected,
       action: (
-        <Button primary onClick={() => props.call("open_sound_settings")}>
-          <Settings size={16} />
+        <SmallButton onClick={() => props.call("open_sound_settings")}>
+          <Settings size={14} />
           Open
-        </Button>
+        </SmallButton>
       ),
     },
     {
-      title: "Turn on your speakers below",
-      detail: "Switch on each speaker Duet should play on.",
+      title: "Turn on two speakers below",
+      detail: "Switch on the speakers Duet should play on.",
       done: props.chosenCount > 0,
     },
   ];
   const current = steps.findIndex((s) => !s.done);
-  if (current === -1) return null;
+  if (state.virtualName !== null || current === -1) return null;
 
   return (
-    <section className="flex flex-col gap-3 rounded-lg border border-line bg-card px-4 py-4">
-      <div>
-        <h2 className="font-semibold">Set up Duet</h2>
-        <p className="text-caption text-muted">
+    <section>
+      <div className="flex min-h-9 items-center justify-between pb-1">
+        <h2 className="font-bold">Set up Duet</h2>
+        <span className="text-caption text-muted">
           Step {current + 1} of {steps.length}
-        </p>
+        </span>
       </div>
-      <ol className="flex flex-col gap-3">
+      <ol className="border-t-2 border-ink">
         {steps.map((step, i) => (
           <StepRow key={i} step={step} number={i + 1} current={i === current} />
         ))}

@@ -1,12 +1,15 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import { Header } from "./components/Header";
-import { OptionsSection } from "./components/OptionsSection";
+import { RefreshCw, Settings } from "lucide-react";
+import { SettingsHeader } from "./components/Header";
+import { CablePrompt } from "./components/CablePrompt";
 import { SetupGuide } from "./components/SetupGuide";
-import { SettingsMenu } from "./components/SettingsMenu";
+import { SettingsPage } from "./components/SettingsPage";
+import { Sleeve } from "./components/Sleeve";
 import { SpeakersSection } from "./components/SpeakersSection";
-import { StatusCard } from "./components/StatusCard";
+import { ActionBar } from "./components/ui";
+import { cx } from "./lib";
 import { applyTheme } from "./lib";
 import type { AppInfo, Args, StateView, Tone } from "./types";
 
@@ -36,7 +39,7 @@ function App() {
   const [state, setState] = useState<StateView | null>(null);
   const [autostart, setAutostartState] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [menuOpen, setMenuOpen] = useState(false);
+  const [view, setView] = useState<"main" | "settings">("main");
   const [info, setInfo] = useState<AppInfo | null>(null);
   const fitRef = useFitWindow();
 
@@ -89,17 +92,45 @@ function App() {
   const canSync = state.running && chosen.length > 1 && !state.syncing;
   const tone = toneOf(state);
 
-  return (
-    <main ref={fitRef} className="flex flex-col gap-5 px-5 pt-4 pb-5">
-      <Header onMenu={() => setMenuOpen(true)} />
+  return view === "settings" ? (
+    <main className="flex h-screen flex-col gap-3 px-5 pt-3 pb-5">
+      <SettingsHeader version={info?.version} onBack={() => setView("main")} />
+      <SettingsPage
+        state={state}
+        info={info}
+        setInfo={setInfo}
+        autostart={autostart}
+        setAutostart={setAutostart}
+        call={call}
+        change={change}
+      />
+    </main>
+  ) : (
+    <main ref={fitRef} className="flex flex-col gap-4 px-4 pt-4 pb-5">
+      <div className="flex flex-col gap-2">
+        <Sleeve state={state} tone={tone} chosen={chosen} onSettings={() => setView("settings")} />
+        {state.virtualName && !state.virtualSelected ? (
+          <ActionBar onClick={() => call("open_sound_settings")}>
+            <Settings size={16} />
+            Open sound settings
+          </ActionBar>
+        ) : (
+          <ActionBar disabled={!canSync} onClick={() => call("sync_now")}>
+            <RefreshCw size={16} className={cx(state.syncing && "animate-spin")} />
+            {state.syncing ? "Syncing" : "Sync now"}
+          </ActionBar>
+        )}
+        {state.unstableSpeaker && (
+          <p className="text-caption text-warn">{state.unstableSpeaker} keeps dropping out. Turn it off and on, or move it closer.</p>
+        )}
+        {error && <p className="text-caption text-error">{error}</p>}
+      </div>
       <SetupGuide state={state} chosenCount={chosen.length} call={call} />
-      <StatusCard state={state} tone={tone} canSync={canSync} error={error} call={call} />
-      <SpeakersSection speakers={speakers} change={change} />
-      <OptionsSection state={state} chosen={chosen} change={change} autostart={autostart} setAutostart={setAutostart} />
-      <p className="text-center text-caption text-muted">Closing the window keeps Duet running in the tray.</p>
-      {menuOpen && (
-        <SettingsMenu info={info} setInfo={setInfo} call={call} change={change} onClose={() => setMenuOpen(false)} />
-      )}
+      <CablePrompt state={state} call={call} change={change} />
+      <SpeakersSection state={state} speakers={speakers} chosen={chosen} change={change} />
+      <p className="text-center text-caption text-muted">
+        {state.lastSync ?? "Closing the window keeps Duet running in the tray."}
+      </p>
     </main>
   );
 }

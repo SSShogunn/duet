@@ -3,8 +3,10 @@ mod devices;
 mod dsp;
 mod engine;
 mod errors;
+mod mic_use;
 mod settings;
 mod sync;
+mod visual;
 
 use std::sync::{Arc, Mutex};
 
@@ -38,14 +40,21 @@ fn get_state(state: State<Shared>) -> StateView {
 }
 
 #[tauri::command]
-fn set_target(app: AppHandle, state: State<Shared>, id: String, enabled: bool) -> StateView {
-    update(&app, &state, |c| {
+fn set_target(app: AppHandle, state: State<Shared>, id: String, enabled: bool) -> Result<StateView, String> {
+    {
+        let c = state.lock().unwrap();
+        let targets = &c.settings.data.targets;
+        if enabled && !targets.contains(&id) && targets.len() >= settings::MAX_SPEAKERS {
+            return Err(format!("Duet plays on up to {} speakers. Turn one off first.", settings::MAX_SPEAKERS));
+        }
+    }
+    Ok(update(&app, &state, |c| {
         let targets = &mut c.settings.data.targets;
         targets.retain(|t| t != &id);
         if enabled {
             targets.push(id);
         }
-    })
+    }))
 }
 
 #[tauri::command]
@@ -71,7 +80,23 @@ fn set_auto_sync(app: AppHandle, state: State<Shared>, enabled: bool) -> StateVi
 
 #[tauri::command]
 fn set_sync_sound(app: AppHandle, state: State<Shared>, sound: String) -> StateView {
-    update(&app, &state, |c| c.settings.data.sync_sound = if sound == "chime" { sound } else { "silent".into() })
+    update(&app, &state, |c| {
+        c.settings.data.sync_sound = if sound == "chime" { sound } else { "silent".into() };
+        c.schedule_background();
+    })
+}
+
+#[tauri::command]
+fn set_background_sync(app: AppHandle, state: State<Shared>, minutes: u32) -> StateView {
+    update(&app, &state, |c| {
+        c.settings.data.background_sync_min = if [5, 15, 30].contains(&minutes) { minutes } else { 0 };
+        c.schedule_background();
+    })
+}
+
+#[tauri::command]
+fn dismiss_cable_prompt(app: AppHandle, state: State<Shared>) -> StateView {
+    update(&app, &state, |c| c.settings.data.cable_prompt_dismissed = true)
 }
 
 #[tauri::command]
@@ -85,7 +110,7 @@ fn set_offset(app: AppHandle, state: State<Shared>, id: String, ms: f32) -> Stat
 
 #[tauri::command]
 fn sync_now(app: AppHandle, state: State<Shared>) -> Result<(), String> {
-    controller::start_sync(app, state.inner().clone())
+    controller::start_sync(app, state.inner().clone(), false)
 }
 
 #[tauri::command]
@@ -237,7 +262,7 @@ fn build_tray(app: &AppHandle) -> tauri::Result<()> {
             "open" => show_window(app),
             "sync" => {
                 let shared = app.state::<Shared>().inner().clone();
-                let _ = controller::start_sync(app.clone(), shared);
+                let _ = controller::start_sync(app.clone(), shared, false);
             }
             "quit" => app.exit(0),
             _ => {}
@@ -281,6 +306,7 @@ pub fn run() {
             let shared: Shared = Arc::new(Mutex::new(Controller::new(settings)));
             app.manage(shared.clone());
             build_tray(app.handle())?;
+            controller::run_meters(app.handle().clone(), shared.clone());
             controller::run_supervisor(app.handle().clone(), shared);
             app.manage(StartHidden(std::env::args().any(|a| a == HIDDEN_ARG)));
             Ok(())
@@ -298,6 +324,8 @@ pub fn run() {
             swap_sides,
             set_auto_sync,
             set_sync_sound,
+            dismiss_cable_prompt,
+            set_background_sync,
             set_offset,
             sync_now,
             get_autostart,

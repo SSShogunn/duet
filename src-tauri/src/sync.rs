@@ -70,11 +70,7 @@ fn record(mic_id: String, stop: Arc<AtomicBool>, started: Arc<AtomicBool>) -> Re
     result
 }
 
-pub fn laptop_sync(handle: &EngineHandle, silent: bool) -> Result<SyncResult, String> {
-    let ids = handle.target_ids();
-    if ids.len() < 2 {
-        return Err("Pick at least two speakers to sync.".into());
-    }
+fn measure_raw_lateness(handle: &EngineHandle, speakers: usize, silent: bool) -> Result<Vec<f32>, String> {
     let mic_id = devices::default_input_id().ok_or("No microphone found.")?;
     let stop = Arc::new(AtomicBool::new(false));
     let started = Arc::new(AtomicBool::new(false));
@@ -87,9 +83,10 @@ pub fn laptop_sync(handle: &EngineHandle, silent: bool) -> Result<SyncResult, St
     }
     thread::sleep(Duration::from_millis(MIC_WARMUP_MS));
 
-    let pattern = dsp::build_pattern(ids.len(), silent);
-    let signals = (0..ids.len()).map(|k| dsp::render_pattern(&pattern, SOURCE_RATE, k)).collect();
-    handle.play_pattern(signals);
+    let pattern = dsp::build_pattern(speakers, silent);
+    let signals = (0..speakers).map(|k| dsp::render_pattern(&pattern, SOURCE_RATE, k)).collect();
+    let over_music = handle.play_pattern(signals, silent);
+    log::debug!("sync signal playing {}", if over_music { "over the music" } else { "with music paused" });
     let deadline = Instant::now() + Duration::from_secs_f32(pattern.length_s + 3.0);
     while !handle.pattern_done() && Instant::now() < deadline && handle.is_running() {
         thread::sleep(Duration::from_millis(20));
@@ -108,18 +105,33 @@ pub fn laptop_sync(handle: &EngineHandle, silent: bool) -> Result<SyncResult, St
     log::debug!("sync recording: {} samples", recording.len());
     let lateness = dsp::measure(&recording, SOURCE_RATE, &pattern)?;
     log::debug!("sync lateness per speaker (ms): {lateness:?}");
+    Ok(lateness)
+}
+
+pub fn laptop_sync(handle: &EngineHandle, silent: bool) -> Result<SyncResult, String> {
+    let ids = handle.target_ids();
+    if ids.len() < 2 {
+        return Err("Pick at least two speakers to sync.".into());
+    }
+    let previous: Vec<f32> = ids.iter().map(|id| handle.extra(id)).collect();
+    for id in &ids {
+        handle.set_extra(id, 0.0);
+    }
+    let lateness = match measure_raw_lateness(handle, ids.len(), silent) {
+        Ok(lateness) => lateness,
+        Err(e) => {
+            for (id, ms) in ids.iter().zip(&previous) {
+                handle.set_extra(id, *ms);
+            }
+            return Err(e);
+        }
+    };
     let latest = lateness.iter().fold(f32::MIN, |m, v| m.max(*v));
     let earliest = lateness.iter().fold(f32::MAX, |m, v| m.min(*v));
-    let wanted: Vec<f32> = ids
-        .iter()
-        .zip(&lateness)
-        .map(|(id, late)| handle.extra(id) + latest - late)
-        .collect();
-    let floor = wanted.iter().fold(f32::MAX, |m, v| m.min(*v));
     let offsets: Vec<(String, f32)> = ids
         .into_iter()
-        .zip(wanted)
-        .map(|(id, ms)| ((id), ((ms - floor) * 10.0).round() / 10.0))
+        .zip(&lateness)
+        .map(|(id, late)| (id, ((latest - late) * 10.0).round() / 10.0))
         .collect();
     for (id, ms) in &offsets {
         handle.set_extra(id, *ms);
@@ -234,7 +246,7 @@ mod hardware {
                 thread::sleep(Duration::from_millis(10));
             }
             thread::sleep(Duration::from_millis(MIC_WARMUP_MS));
-            handle.play_pattern(signals);
+            handle.play_pattern(signals, false);
             while !handle.pattern_done() {
                 thread::sleep(Duration::from_millis(20));
             }

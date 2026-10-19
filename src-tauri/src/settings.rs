@@ -15,6 +15,8 @@ pub struct Settings {
     pub debug_logging: bool,
     pub theme: String,
     pub sync_sound: String,
+    pub background_sync_min: u32,
+    pub cable_prompt_dismissed: bool,
 }
 
 impl Default for Settings {
@@ -28,9 +30,13 @@ impl Default for Settings {
             debug_logging: false,
             theme: "system".into(),
             sync_sound: "silent".into(),
+            background_sync_min: 15,
+            cable_prompt_dismissed: false,
         }
     }
 }
+
+pub const MAX_SPEAKERS: usize = 2;
 
 pub struct SettingsStore {
     path: PathBuf,
@@ -44,6 +50,8 @@ impl SettingsStore {
             .ok()
             .and_then(|text| serde_json::from_str(&text).ok())
             .unwrap_or_default();
+        let mut data: Settings = data;
+        data.targets.truncate(MAX_SPEAKERS);
         SettingsStore { path, data }
     }
 

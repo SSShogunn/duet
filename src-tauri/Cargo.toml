@@ -30,6 +30,7 @@ tauri-plugin-single-instance = "2.5.4"
 windows = { version = "0.62", features = ["Win32_Foundation", "Win32_Media_Audio", "Win32_Media_Audio_Endpoints", "Win32_System_Com", "Win32_System_Threading"] }
 log = "0.4.34"
 tauri-plugin-log = "2.10.1"
+winreg = "0.56.0"
 
 
 # Read the optimization guideline for more details: https://tauri.app/concept/size/#cargo-configuration

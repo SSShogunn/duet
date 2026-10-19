@@ -4,9 +4,9 @@
 
 # Duet
 
-**Play your PC's audio on several speakers at once, in sync.**
+**Play your PC's audio on two speakers at once, in sync.**
 
-Pair two Bluetooth speakers, a speaker and your headphones, or any mix of outputs. Duet keeps them lined up so they sound like one system, not an echo.
+Pair two Bluetooth speakers, or a speaker and your laptop's own speakers. Duet keeps them lined up so they sound like one system, not an echo.
 
 [![Latest release](https://img.shields.io/github/v/release/SSShogunn/duet?label=download&color=2b2b2e)](https://github.com/SSShogunn/duet/releases/latest)
 [![Release build](https://github.com/SSShogunn/duet/actions/workflows/release.yml/badge.svg)](https://github.com/SSShogunn/duet/actions/workflows/release.yml)
@@ -18,22 +18,20 @@ Pair two Bluetooth speakers, a speaker and your headphones, or any mix of output
 
 <a href="docs/duet-demo.mp4"><img src="docs/duet-demo.gif" width="880" alt="Duet demo: two speakers 122 ms apart get synced with a sound you can't hear" /></a>
 
-<sub>Click the preview to watch the full video with sound.</sub>
-
 </div>
 
 ---
 
 ## Why Duet
 
-Windows plays sound on one output at a time. Bluetooth speakers also each add their own delay, often 100–300 ms, and the delay shifts while they play. Duet copies your audio to every speaker you pick and corrects those delays continuously.
+Windows plays sound on one output at a time. Bluetooth speakers also each add their own delay, often 100–300 ms, and the delay shifts while they play. Duet copies your audio to both speakers you pick and corrects those delays continuously.
 
 | | |
 |---|---|
-| 🔊 **Any speakers** | Bluetooth, USB, HDMI, the laptop's own speakers, in any combination |
+| 🔊 **Any speakers** | Any two outputs: Bluetooth, USB, HDMI or the laptop's own speakers |
 | 🤫 **Silent sync** | Lines speakers up with a 19–20.8 kHz signal most adults can't hear, measured by your laptop mic in about 7 seconds |
 | 🎧 **Stereo pair** | Turn two speakers into a left and right pair, and swap sides with one click |
-| 🎚️ **Windows volume works** | The normal volume slider and mute keys control every speaker |
+| 🎚️ **Windows volume works** | The normal volume slider and mute keys control both speakers |
 | 🩹 **Drift correction** | Keeps speakers aligned while they play, with no audible jumps |
 | 🌗 **Light and dark** | Follows your Windows theme, or pick one |
 

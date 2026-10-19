@@ -6,6 +6,8 @@ use windows::Win32::Media::Audio::{IMMDeviceEnumerator, MMDeviceEnumerator};
 use windows::Win32::System::Com::{CoCreateInstance, CLSCTX_ALL};
 
 pub const VIRTUAL_MARKER: &str = "VB-Audio Virtual Cable";
+pub const CABLE_NAME: &str = "Duet Input";
+const MULTICHANNEL_MARKER: &str = "16ch";
 
 #[derive(Serialize, Clone, PartialEq)]
 #[serde(rename_all = "camelCase")]
@@ -14,6 +16,7 @@ pub struct OutputDevice {
     pub name: String,
     pub is_default: bool,
     pub is_virtual: bool,
+    pub name_missing: bool,
 }
 
 pub fn is_virtual(name: &str) -> bool {
@@ -31,10 +34,23 @@ pub fn list_outputs() -> Result<Vec<OutputDevice>, WasapiError> {
     for index in 0..collection.get_nbr_devices()? {
         let device = collection.get_device_at_index(index)?;
         let id = device.get_id()?;
-        let name = device.get_friendlyname()?;
+        let interface = device.get_interface_friendlyname().unwrap_or_default();
+        let friendly = device.get_friendlyname().unwrap_or_default();
+        let name_missing = friendly.trim().is_empty();
+        let name = if name_missing {
+            let description = device.get_description().unwrap_or_default();
+            if interface.is_empty() { description } else { format!("{description} ({interface})") }
+        } else {
+            friendly
+        };
+        let virtual_device = is_virtual(&interface) || is_virtual(&name);
+        if virtual_device && name.contains(MULTICHANNEL_MARKER) {
+            continue;
+        }
         devices.push(OutputDevice {
             is_default: id == default_id,
-            is_virtual: is_virtual(&name),
+            is_virtual: virtual_device,
+            name_missing,
             name,
             id,
         });
@@ -81,6 +97,19 @@ impl EndpointVolume {
             }
             let db = self.volume.GetMasterVolumeLevel()?;
             Ok(10f32.powf(db / 20.0))
+        }
+    }
+}
+
+#[cfg(test)]
+mod hardware {
+    #[test]
+    #[ignore]
+    fn reports_output_volumes() {
+        let _ = wasapi::initialize_mta();
+        for d in super::list_outputs().expect("devices") {
+            let gain = super::EndpointVolume::open(&d.id).and_then(|v| v.gain());
+            println!("{:<45} gain {:?}", d.name, gain.map(|g| (g * 1000.0).round() / 1000.0));
         }
     }
 }

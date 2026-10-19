@@ -19,6 +19,10 @@ export type StateView = {
   swap: boolean;
   autoSync: boolean;
   syncSound: SyncSound;
+  backgroundSyncMin: number;
+  unstableSpeaker: string | null;
+  cableRenamed: boolean;
+  cablePrompt: boolean;
   lastSync: string | null;
 };
 

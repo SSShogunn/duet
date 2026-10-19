@@ -1,4 +1,4 @@
-import type { Theme, Tone } from "./types";
+import type { Theme } from "./types";
 
 export function cx(...classes: (string | false | null | undefined)[]) {
   return classes.filter(Boolean).join(" ");
@@ -11,13 +11,6 @@ export function shortName(name: string) {
 export function virtualLabel(name: string) {
   return name.replace(/ \(VB-Audio Virtual Cable\)$/, "");
 }
-
-export const toneClass: Record<Tone, string> = {
-  ok: "bg-ok-soft text-ok",
-  busy: "bg-busy-soft text-busy",
-  warn: "bg-warn-soft text-warn",
-  idle: "bg-soft text-muted",
-};
 
 const darkQuery = window.matchMedia("(prefers-color-scheme: dark)");
 let chosenTheme: Theme = "system";

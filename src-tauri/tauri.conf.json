@@ -12,7 +12,7 @@
   "app": {
     "windows": [
       {
-        "title": "Duet",
+        "title": "",
         "width": 480,
         "height": 720,
         "visible": false,

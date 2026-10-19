@@ -1,19 +1,29 @@
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use serde::Serialize;
-use tauri::{AppHandle, Emitter};
+use tauri::{AppHandle, Emitter, Manager};
 use tauri_plugin_notification::NotificationExt;
 
 use crate::devices::{self, OutputDevice};
-use crate::engine::{Engine, TargetSpec};
-use crate::settings::SettingsStore;
+use crate::engine::{Engine, EngineHandle, TargetSpec};
+use crate::mic_use;
+use crate::settings::{SettingsStore, MAX_SPEAKERS};
 use crate::sync;
 
 const POLL: Duration = Duration::from_millis(500);
+const METER_INTERVAL: Duration = Duration::from_millis(40);
 const RETRY_DELAY: Duration = Duration::from_secs(3);
 const AUTO_SYNC_DELAY: Duration = Duration::from_secs(8);
+const GLITCH_SYNC_DELAY: Duration = Duration::from_secs(10);
+const MIN_SYNC_GAP: Duration = Duration::from_secs(60);
+const BUSY_MIC_RETRY: Duration = Duration::from_secs(60);
+const FAILED_RETRY: Duration = Duration::from_secs(300);
+const UNSTABLE_WINDOW: Duration = Duration::from_secs(300);
+const UNSTABLE_GLITCHES: usize = 3;
+const STABLE_AGAIN: Duration = Duration::from_secs(600);
 
 #[derive(Serialize, Clone, PartialEq)]
 #[serde(rename_all = "camelCase")]
@@ -25,6 +35,12 @@ pub struct DeviceView {
     pub enabled: bool,
     pub offset_ms: f32,
     pub side: Option<String>,
+}
+
+#[derive(Serialize, Clone, Default)]
+pub struct MetersView {
+    pub spectrum: Vec<f32>,
+    pub levels: HashMap<String, f32>,
 }
 
 #[derive(Serialize, Clone, PartialEq)]
@@ -40,6 +56,10 @@ pub struct StateView {
     pub swap: bool,
     pub auto_sync: bool,
     pub sync_sound: String,
+    pub background_sync_min: u32,
+    pub unstable_speaker: Option<String>,
+    pub cable_renamed: bool,
+    pub cable_prompt: bool,
     pub last_sync: Option<String>,
 }
 
@@ -52,6 +72,12 @@ pub struct Controller {
     syncing: bool,
     last_sync: Option<String>,
     auto_sync_at: Option<Instant>,
+    background_at: Option<Instant>,
+    background_syncing: bool,
+    last_sync_at: Option<Instant>,
+    speaker_glitches: HashMap<String, u64>,
+    glitch_times: HashMap<String, Vec<Instant>>,
+    unstable: Option<String>,
     retry_at: Instant,
 }
 
@@ -68,15 +94,24 @@ impl Controller {
             syncing: false,
             last_sync: None,
             auto_sync_at: None,
+            background_at: None,
+            background_syncing: false,
+            last_sync_at: None,
+            speaker_glitches: HashMap::new(),
+            glitch_times: HashMap::new(),
+            unstable: None,
             retry_at: Instant::now(),
         }
     }
 
     fn wanted_targets(&self) -> Vec<OutputDevice> {
         let mut wanted: Vec<OutputDevice> = self
-            .devices
+            .settings
+            .data
+            .targets
             .iter()
-            .filter(|d| !d.is_virtual && self.settings.data.targets.contains(&d.id))
+            .filter_map(|id| self.devices.iter().find(|d| !d.is_virtual && &d.id == id))
+            .take(MAX_SPEAKERS)
             .cloned()
             .collect();
         wanted.sort_by(|a, b| a.name.cmp(&b.name));
@@ -111,6 +146,63 @@ impl Controller {
         }
         self.engine_targets.clear();
         self.auto_sync_at = None;
+        self.background_at = None;
+        self.speaker_glitches.clear();
+        self.glitch_times.clear();
+        self.unstable = None;
+    }
+
+    fn track_glitches(&mut self) -> Option<String> {
+        let speakers = self.engine.as_ref()?.handle().speaker_glitches();
+        let now = Instant::now();
+        let mut newly_unstable = None;
+        for (name, count) in speakers {
+            let before = self.speaker_glitches.insert(name.clone(), count).unwrap_or(0);
+            if count <= before {
+                continue;
+            }
+            let times = self.glitch_times.entry(name.clone()).or_default();
+            times.push(now);
+            times.retain(|t| now.duration_since(*t) < UNSTABLE_WINDOW);
+            if times.len() >= UNSTABLE_GLITCHES && self.unstable.is_none() {
+                self.unstable = Some(name.clone());
+                newly_unstable = Some(name);
+            }
+        }
+        if let Some(name) = &self.unstable {
+            let last = self.glitch_times.get(name).and_then(|t| t.last().copied());
+            if last.is_none_or(|t| now.duration_since(t) > STABLE_AGAIN) {
+                log::info!("{name} has been stable again for a while");
+                self.unstable = None;
+            }
+        }
+        newly_unstable
+    }
+
+    fn background_allowed(&self) -> bool {
+        self.settings.data.background_sync_min > 0
+            && self.settings.data.sync_sound != "chime"
+            && self.engine_targets.len() > 1
+    }
+
+    pub fn schedule_background(&mut self) {
+        self.background_at = self
+            .background_allowed()
+            .then(|| Instant::now() + Duration::from_secs(self.settings.data.background_sync_min as u64 * 60));
+    }
+
+    fn schedule_after_glitch(&mut self) {
+        if !self.background_allowed() || self.syncing || self.unstable.is_some() {
+            return;
+        }
+        let mut at = Instant::now() + GLITCH_SYNC_DELAY;
+        if let Some(last) = self.last_sync_at {
+            at = at.max(last + MIN_SYNC_GAP);
+        }
+        if self.background_at.is_none_or(|current| at < current) {
+            log::debug!("background sync moved up after a glitch");
+            self.background_at = Some(at);
+        }
     }
 
     fn tick(&mut self) {
@@ -143,7 +235,7 @@ impl Controller {
         }
 
         let Some(source) = source else {
-            let name = self.devices.iter().find(|d| d.is_virtual).map(|d| d.name.clone());
+            let name = self.preferred_virtual().map(|d| d.name.clone());
             self.status = match name {
                 Some(name) => format!("Idle. Select \"{name}\" as your Windows sound output to start."),
                 None => "Duet needs the free VB-Audio Virtual Cable driver. Install it, then restart your PC.".into(),
@@ -172,6 +264,7 @@ impl Controller {
             if self.settings.data.auto_sync && wanted.len() > 1 {
                 self.auto_sync_at = Some(Instant::now() + AUTO_SYNC_DELAY);
             }
+            self.schedule_background();
         }
     }
 
@@ -187,11 +280,15 @@ impl Controller {
         };
         let handle = self.engine.as_ref().map(|e| e.handle());
         StateView {
-            status: if self.syncing { "Syncing speakers: stay quiet for a few seconds...".into() } else { self.status.clone() },
+            status: if self.syncing && !self.background_syncing {
+                "Syncing speakers: stay quiet for a few seconds...".into()
+            } else {
+                self.status.clone()
+            },
             running: handle.as_ref().is_some_and(|h| h.is_running()),
-            syncing: self.syncing,
+            syncing: self.syncing && !self.background_syncing,
             virtual_selected: self.devices.iter().any(|d| d.is_default && d.is_virtual),
-            virtual_name: self.devices.iter().find(|d| d.is_virtual).map(|d| d.name.clone()),
+            virtual_name: self.preferred_virtual().map(|d| d.name.clone()),
             devices: self
                 .devices
                 .iter()
@@ -209,8 +306,26 @@ impl Controller {
             swap: self.settings.data.swap,
             auto_sync: self.settings.data.auto_sync,
             sync_sound: self.settings.data.sync_sound.clone(),
+            background_sync_min: self.settings.data.background_sync_min,
+            unstable_speaker: self.unstable.as_deref().map(short),
+            cable_renamed: self.preferred_virtual().is_some_and(|d| d.name.starts_with(devices::CABLE_NAME) && !d.name_missing),
+            cable_prompt: self.preferred_virtual().is_some_and(|d| {
+                d.name_missing || (!self.settings.data.cable_prompt_dismissed && !d.name.starts_with(devices::CABLE_NAME))
+            }),
             last_sync: self.last_sync.clone(),
         }
+    }
+
+    fn preferred_virtual(&self) -> Option<&OutputDevice> {
+        let virtuals = || self.devices.iter().filter(|d| d.is_virtual);
+        virtuals()
+            .find(|d| d.name.starts_with(devices::CABLE_NAME))
+            .or_else(|| virtuals().find(|d| d.name.starts_with("CABLE Input")))
+            .or_else(|| virtuals().next())
+    }
+
+    fn engine_handle(&self) -> Option<EngineHandle> {
+        self.engine.as_ref().map(|e| e.handle())
     }
 
     fn glitches(&self) -> u64 {
@@ -235,7 +350,7 @@ pub fn short(name: &str) -> String {
     name.trim_start_matches("Speakers (").trim_end_matches(')').to_string()
 }
 
-pub fn start_sync(app: AppHandle, controller: Shared) -> Result<(), String> {
+pub fn start_sync(app: AppHandle, controller: Shared, background: bool) -> Result<(), String> {
     let (handle, silent) = {
         let mut c = controller.lock().unwrap();
         if c.syncing {
@@ -249,14 +364,16 @@ pub fn start_sync(app: AppHandle, controller: Shared) -> Result<(), String> {
             return Err("Pick at least two speakers to sync.".into());
         }
         c.syncing = true;
+        c.background_syncing = background;
         c.auto_sync_at = None;
+        c.background_at = None;
         (handle, c.settings.data.sync_sound != "chime")
     };
     emit(&app, &controller);
     thread::spawn(move || {
         let _ = wasapi::initialize_mta();
         let mut result = sync::laptop_sync(&handle, silent);
-        if silent && handle.is_running() {
+        if silent && !background && handle.is_running() {
             if let Err(e) = &result {
                 log::info!("silent sync failed ({e}); trying the chime");
                 result = sync::laptop_sync(&handle, false);
@@ -265,6 +382,12 @@ pub fn start_sync(app: AppHandle, controller: Shared) -> Result<(), String> {
         let message = {
             let mut c = controller.lock().unwrap();
             c.syncing = false;
+            c.background_syncing = false;
+            c.last_sync_at = Some(Instant::now());
+            c.schedule_background();
+            if background && result.is_err() && c.background_at.is_some() {
+                c.background_at = Some(Instant::now() + FAILED_RETRY);
+            }
             match &result {
                 Ok(r) => {
                     for (id, ms) in &r.offsets {
@@ -280,14 +403,26 @@ pub fn start_sync(app: AppHandle, controller: Shared) -> Result<(), String> {
                         })
                         .collect();
                     let detail = if names.is_empty() { "no delay needed".to_string() } else { names.join(", ") };
-                    format!("Synced. Gap was {:.0} ms; {detail}.", r.gap_ms)
+                    if background {
+                        format!("Kept in sync in the background. Last fix: {:.0} ms; {detail}.", r.gap_ms)
+                    } else {
+                        format!("Synced. Gap was {:.0} ms; {detail}.", r.gap_ms)
+                    }
                 }
                 Err(e) => e.clone(),
             }
         };
+        let kind = if background { "background sync" } else { "sync" };
         match &result {
-            Ok(r) => log::info!("sync ok: gap {:.1} ms, offsets {:?}", r.gap_ms, r.offsets.iter().map(|(_, ms)| *ms).collect::<Vec<_>>()),
-            Err(e) => log::warn!("sync failed: {e}"),
+            Ok(r) => log::info!("{kind} ok: gap {:.1} ms, offsets {:?}", r.gap_ms, r.offsets.iter().map(|(_, ms)| *ms).collect::<Vec<_>>()),
+            Err(e) => log::warn!("{kind} failed: {e}"),
+        }
+        if background {
+            if result.is_ok() {
+                controller.lock().unwrap().last_sync = Some(message);
+            }
+            emit(&app, &controller);
+            return;
         }
         controller.lock().unwrap().last_sync = Some(message.clone());
         let title = if result.is_ok() { "Speakers synced" } else { "Sync failed" };
@@ -295,6 +430,25 @@ pub fn start_sync(app: AppHandle, controller: Shared) -> Result<(), String> {
         emit(&app, &controller);
     });
     Ok(())
+}
+
+pub fn run_meters(app: AppHandle, controller: Shared) {
+    thread::spawn(move || loop {
+        thread::sleep(METER_INTERVAL);
+        let visible = app.get_webview_window("main").and_then(|w| w.is_visible().ok()).unwrap_or(false);
+        if !visible {
+            continue;
+        }
+        let handle = controller.lock().unwrap().engine_handle();
+        let view = match handle {
+            Some(handle) => {
+                let (spectrum, levels) = handle.meters();
+                MetersView { spectrum, levels: levels.into_iter().collect() }
+            }
+            None => MetersView::default(),
+        };
+        let _ = app.emit("meters", view);
+    });
 }
 
 pub fn emit(app: &AppHandle, controller: &Shared) {
@@ -310,15 +464,32 @@ pub fn run_supervisor(app: AppHandle, controller: Shared) {
         let mut last_glitches = 0u64;
         let mut last_devices: Vec<String> = Vec::new();
         loop {
-            let (view, sync_due, glitches, names) = {
+            let (view, sync_due, background_due, glitches, names, unstable) = {
                 let mut c = controller.lock().unwrap();
                 c.tick();
-                let due = c.auto_sync_at.is_some_and(|at| Instant::now() >= at) && !c.syncing;
+                let now = Instant::now();
+                let due = c.auto_sync_at.is_some_and(|at| now >= at) && !c.syncing;
                 if due {
                     c.auto_sync_at = None;
                 }
-                (c.view(), due, c.glitches(), c.device_names())
+                let background_due = !due && !c.syncing && c.background_at.is_some_and(|at| now >= at);
+                let glitches = c.glitches();
+                let unstable = c.track_glitches();
+                if glitches > last_glitches {
+                    c.schedule_after_glitch();
+                }
+                (c.view(), due, background_due, glitches, c.device_names(), unstable)
             };
+            if let Some(name) = unstable {
+                let name = short(&name);
+                log::warn!("{name} keeps dropping out; pausing glitch re-syncs until it reconnects");
+                let _ = app
+                    .notification()
+                    .builder()
+                    .title(format!("{name} keeps dropping out"))
+                    .body("Its Bluetooth link is unstable, which causes the crackle. Turn the speaker off and on, or move it closer. Duet re-syncs when it reconnects.")
+                    .show();
+            }
             if view.status != last_status {
                 log::info!("status: {}", view.status);
                 last_status = view.status.clone();
@@ -333,7 +504,15 @@ pub fn run_supervisor(app: AppHandle, controller: Shared) {
             last_glitches = glitches;
             if sync_due {
                 log::info!("auto-sync starting");
-                let _ = start_sync(app.clone(), controller.clone());
+                let _ = start_sync(app.clone(), controller.clone(), false);
+            } else if background_due {
+                if let Some(app_name) = mic_use::other_app_using_microphone() {
+                    log::debug!("background sync postponed: microphone in use by {app_name}");
+                    controller.lock().unwrap().background_at = Some(Instant::now() + BUSY_MIC_RETRY);
+                } else {
+                    log::debug!("background sync starting");
+                    let _ = start_sync(app.clone(), controller.clone(), true);
+                }
             }
             if last.as_ref() != Some(&view) {
                 let _ = app.emit("state", view.clone());
