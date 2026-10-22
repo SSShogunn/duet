@@ -7,6 +7,7 @@ use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager};
 use tauri_plugin_notification::NotificationExt;
 
+use crate::bluetooth::{self, Outcome};
 use crate::devices::{self, OutputDevice};
 use crate::engine::{Engine, EngineHandle, TargetSpec};
 use crate::mic_use;
@@ -24,6 +25,7 @@ const FAILED_RETRY: Duration = Duration::from_secs(300);
 const UNSTABLE_WINDOW: Duration = Duration::from_secs(300);
 const UNSTABLE_GLITCHES: usize = 3;
 const STABLE_AGAIN: Duration = Duration::from_secs(600);
+const RECONNECT_WAIT: Duration = Duration::from_secs(8);
 
 #[derive(Serialize, Clone, PartialEq)]
 #[serde(rename_all = "camelCase")]
@@ -58,6 +60,7 @@ pub struct StateView {
     pub sync_sound: String,
     pub background_sync_min: u32,
     pub unstable_speaker: Option<String>,
+    pub bluetooth_resetting: bool,
     pub cable_renamed: bool,
     pub cable_prompt: bool,
     pub last_sync: Option<String>,
@@ -78,6 +81,7 @@ pub struct Controller {
     speaker_glitches: HashMap<String, u64>,
     glitch_times: HashMap<String, Vec<Instant>>,
     unstable: Option<String>,
+    bluetooth_resetting: bool,
     retry_at: Instant,
 }
 
@@ -100,6 +104,7 @@ impl Controller {
             speaker_glitches: HashMap::new(),
             glitch_times: HashMap::new(),
             unstable: None,
+            bluetooth_resetting: false,
             retry_at: Instant::now(),
         }
     }
@@ -205,7 +210,28 @@ impl Controller {
         }
     }
 
+    fn begin_bluetooth_reset(&mut self) -> Result<(), String> {
+        if self.bluetooth_resetting {
+            return Err("Bluetooth is already being reset.".into());
+        }
+        if self.syncing {
+            return Err("Wait for the sync to finish, then try again.".into());
+        }
+        self.stop_engine();
+        self.bluetooth_resetting = true;
+        Ok(())
+    }
+
+    fn finish_bluetooth_reset(&mut self) {
+        self.bluetooth_resetting = false;
+        self.retry_at = Instant::now() + RECONNECT_WAIT;
+    }
+
     fn tick(&mut self) {
+        if self.bluetooth_resetting {
+            self.status = "Resetting Bluetooth. Sound cuts out for about 15 seconds.".into();
+            return;
+        }
         match devices::list_outputs() {
             Ok(list) => self.devices = list,
             Err(e) => {
@@ -308,6 +334,7 @@ impl Controller {
             sync_sound: self.settings.data.sync_sound.clone(),
             background_sync_min: self.settings.data.background_sync_min,
             unstable_speaker: self.unstable.as_deref().map(short),
+            bluetooth_resetting: self.bluetooth_resetting,
             cable_renamed: self.preferred_virtual().is_some_and(|d| d.name.starts_with(devices::CABLE_NAME) && !d.name_missing),
             cable_prompt: self.preferred_virtual().is_some_and(|d| {
                 d.name_missing || (!self.settings.data.cable_prompt_dismissed && !d.name.starts_with(devices::CABLE_NAME))
@@ -432,6 +459,46 @@ pub fn start_sync(app: AppHandle, controller: Shared, background: bool) -> Resul
     Ok(())
 }
 
+pub fn start_bluetooth_reset(app: AppHandle, controller: Shared) -> Result<(), String> {
+    controller.lock().unwrap().begin_bluetooth_reset()?;
+    emit(&app, &controller);
+    thread::spawn(move || {
+        log::info!("bluetooth reset starting");
+        let outcome = bluetooth::reset();
+        controller.lock().unwrap().finish_bluetooth_reset();
+        let (title, body) = match &outcome {
+            Outcome::Done => {
+                log::info!("bluetooth reset done");
+                ("Bluetooth reset", "Your speakers will reconnect in a few seconds.")
+            }
+            Outcome::Cancelled => {
+                log::info!("bluetooth reset cancelled at the permission prompt");
+                emit(&app, &controller);
+                return;
+            }
+            Outcome::NoAdapter => {
+                log::error!("bluetooth reset: adapter not found");
+                ("Couldn't reset Bluetooth", "Windows didn't list a Bluetooth adapter.")
+            }
+            Outcome::InUse => {
+                log::error!("bluetooth reset: adapter would not switch off");
+                ("Couldn't reset Bluetooth", "Windows wouldn't release the adapter. Close Galaxy Buds and try again.")
+            }
+            Outcome::NotBack => {
+                log::error!("bluetooth reset: adapter did not switch back on");
+                ("Bluetooth is off", "Turn Bluetooth back on in Windows settings.")
+            }
+            Outcome::Failed(e) => {
+                log::error!("bluetooth reset failed: {e}");
+                ("Couldn't reset Bluetooth", "Something went wrong. Details are in the log.")
+            }
+        };
+        let _ = app.notification().builder().title(title).body(body).show();
+        emit(&app, &controller);
+    });
+    Ok(())
+}
+
 pub fn run_meters(app: AppHandle, controller: Shared) {
     thread::spawn(move || loop {
         thread::sleep(METER_INTERVAL);
@@ -487,7 +554,7 @@ pub fn run_supervisor(app: AppHandle, controller: Shared) {
                     .notification()
                     .builder()
                     .title(format!("{name} keeps dropping out"))
-                    .body("Its Bluetooth link is unstable, which causes the crackle. Turn the speaker off and on, or move it closer. Duet re-syncs when it reconnects.")
+                    .body("Its Bluetooth link is unstable, which causes the crackle. Open Duet and press Reset Bluetooth, or move the speaker closer.")
                     .show();
             }
             if view.status != last_status {

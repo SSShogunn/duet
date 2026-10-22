@@ -1,3 +1,4 @@
+mod bluetooth;
 mod controller;
 mod devices;
 mod dsp;
@@ -206,6 +207,11 @@ fn open_vb_cable_page(app: AppHandle) -> Result<(), String> {
 }
 
 #[tauri::command]
+fn reset_bluetooth(app: AppHandle, state: State<Shared>) -> Result<(), String> {
+    controller::start_bluetooth_reset(app, state.inner().clone())
+}
+
+#[tauri::command]
 fn reset_offsets(app: AppHandle, state: State<Shared>) -> StateView {
     log::info!("speaker delays reset");
     update(&app, &state, |c| c.reset_offsets())
@@ -278,6 +284,9 @@ fn build_tray(app: &AppHandle) -> tauri::Result<()> {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    if std::env::args().any(|a| a == bluetooth::RESET_ARG) {
+        std::process::exit(bluetooth::run_elevated_reset());
+    }
     tauri::Builder::default()
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| show_window(app)))
         .plugin(tauri_plugin_opener::init())
@@ -336,6 +345,7 @@ pub fn run() {
             open_log_folder,
             open_sound_settings,
             open_vb_cable_page,
+            reset_bluetooth,
             reset_offsets,
             quit_app,
             fit_window
