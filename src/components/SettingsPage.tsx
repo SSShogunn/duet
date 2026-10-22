@@ -117,6 +117,11 @@ export function SettingsPage(props: {
           <Row title="Debug logging" detail="More detail in the log file">
             <Switch checked={info?.debugLogging ?? false} label="Debug logging" onChange={setDebug} />
           </Row>
+          <LinkRow
+            title="Reset Bluetooth"
+            detail={state.bluetoothResetting ? "Resetting, this takes about 15 seconds" : "Clears crackling without a restart. Sound cuts out briefly"}
+            onClick={() => !state.bluetoothResetting && call("reset_bluetooth")}
+          />
           <LinkRow title="Open log folder" onClick={() => call("open_log_folder")} />
           <LinkRow title="Reset speaker delays" detail="Then press Sync to measure again" onClick={() => change("reset_offsets")} />
         </div>

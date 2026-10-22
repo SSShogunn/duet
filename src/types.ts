@@ -21,6 +21,7 @@ export type StateView = {
   syncSound: SyncSound;
   backgroundSyncMin: number;
   unstableSpeaker: string | null;
+  bluetoothResetting: boolean;
   cableRenamed: boolean;
   cablePrompt: boolean;
   lastSync: string | null;

@@ -8,7 +8,7 @@ import { SetupGuide } from "./components/SetupGuide";
 import { SettingsPage } from "./components/SettingsPage";
 import { Sleeve } from "./components/Sleeve";
 import { SpeakersSection } from "./components/SpeakersSection";
-import { ActionBar } from "./components/ui";
+import { ActionBar, SmallButton } from "./components/ui";
 import { cx } from "./lib";
 import { applyTheme } from "./lib";
 import type { AppInfo, Args, StateView, Tone } from "./types";
@@ -121,7 +121,10 @@ function App() {
           </ActionBar>
         )}
         {state.unstableSpeaker && (
-          <p className="text-caption text-warn">{state.unstableSpeaker} keeps dropping out. Turn it off and on, or move it closer.</p>
+          <div className="flex items-center gap-3">
+            <p className="flex-1 text-caption text-warn">{state.unstableSpeaker} keeps dropping out. Reset Bluetooth to clear the crackle.</p>
+            <SmallButton onClick={() => call("reset_bluetooth")}>Reset</SmallButton>
+          </div>
         )}
         {error && <p className="text-caption text-error">{error}</p>}
       </div>
